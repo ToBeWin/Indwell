@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Indwell">
+  <rect width="128" height="128" rx="28" fill="#18231f"/>
+  <path d="M33 73c0-22 14-40 31-40s31 18 31 40v20H78V73c0-11-6-20-14-20s-14 9-14 20v20H33V73Z" fill="#f5f7f4"/>
+  <circle cx="64" cy="88" r="7" fill="#39b981"/>
+</svg>

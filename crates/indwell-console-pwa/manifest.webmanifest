@@ -1,0 +1,17 @@
+{
+  "name": "Indwell Console",
+  "short_name": "Indwell",
+  "description": "Static Phase 0 console for Indwell OS host simulator.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#f5f7f4",
+  "theme_color": "#18231f",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

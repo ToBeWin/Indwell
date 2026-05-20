@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    "crates/indwell-core",
+    "crates/indwell-protocol",
+    "crates/indwell-channel",
+    "crates/indwell-security",
+    "crates/indwell-memory",
+    "crates/indwell-reflection",
+    "crates/indwell-runs",
+    "crates/indwell-provider",
+    "crates/indwell-ota",
+    "crates/indwell-hal",
+    "crates/indwell-fw-esp32s3",
+    "crates/indwell-host-sim",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/indwell-os/indwell-os"
+rust-version = "1.82"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.7"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+ed25519-dalek = "2.1"
+hmac = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "signal", "fs", "net"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

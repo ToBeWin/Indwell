@@ -1,0 +1,1770 @@
+mod context;
+mod ota;
+mod planner;
+mod provider_config;
+
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get, post},
+    Json, Router,
+};
+use chrono::Utc;
+use context::{apply_context_pack, ContextAssembler};
+use indwell_channel::{
+    BasicChannelAdapter, ChannelAdapter, ChannelEvent, ChannelInbound, ChannelKind, ChannelPolicy,
+    ChannelPrincipal,
+};
+use indwell_core::{
+    default_tools, AgentRun, AuthContext, AuthMethod, DeviceState, Event, ProviderSelection,
+    RiskLevel, ToolAuditOutcome, ToolDescriptor,
+};
+use indwell_memory::{
+    JsonlMemoryStore, MemoryExport, MemoryKind, MemoryMetabolismReport, MemoryQuery, MemoryRecord,
+    MemorySource, MemoryStore,
+};
+use indwell_ota::{OtaManifest, OtaSlot, OtaTrustStore, OtaVerificationReport};
+use indwell_protocol::MobileCommand;
+use indwell_protocol::{
+    ApiEnvelope, CustomWebhookInputRequest, ProviderConfig, ProviderConfigSet, ProvisioningRequest,
+    ProvisioningResponse,
+};
+use indwell_provider::{
+    AsrProvider, AudioBlob, ChatMessage, ChatRequest, LlmProvider, MockAsrProvider,
+    MockLlmProvider, MockTtsProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, Transcript,
+    TtsProvider, VoiceProfile,
+};
+use indwell_reflection::{ReflectionBudget, ReflectionEngine, ReflectionReport};
+use indwell_runs::{JsonlRunStore, RunStore};
+use indwell_security::{
+    AuthSession, ConfirmationGrant, ConfirmationGrantManager, FileSealedSecretStore,
+    JsonPairedDeviceStore, PairedDevice, PairingChallenge, PairingManager, PassphraseChallenge,
+    PassphraseChallengeManager, PolicyDecision, PolicyEngine, SessionTokenManager, SignedRequest,
+    StoredSecret,
+};
+use ota::JsonOtaManifestStore;
+use planner::plan_tool_calls;
+use provider_config::JsonProviderConfigStore;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::sync::Mutex;
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use uuid::Uuid;
+
+#[derive(Clone)]
+struct AppState {
+    memory: Arc<Mutex<JsonlMemoryStore>>,
+    runs: Arc<Mutex<JsonlRunStore>>,
+    providers: Arc<Mutex<JsonProviderConfigStore>>,
+    provisioning: Arc<Mutex<Option<ProvisioningRequest>>>,
+    secrets: Arc<Mutex<FileSealedSecretStore>>,
+    pairing: Arc<Mutex<PairingManager>>,
+    paired_devices: Arc<JsonPairedDeviceStore>,
+    sessions: Arc<Mutex<SessionTokenManager>>,
+    grants: Arc<Mutex<ConfirmationGrantManager>>,
+    passphrases: Arc<Mutex<PassphraseChallengeManager>>,
+    ota: Arc<Mutex<JsonOtaManifestStore>>,
+    context: Arc<ContextAssembler>,
+    policy: Arc<PolicyEngine>,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    service: &'static str,
+    status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelInputRequest {
+    channel: ChannelKind,
+    session_id: String,
+    subject_hint: Option<String>,
+    session_token: Option<String>,
+    text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChannelInputResponse {
+    event: ChannelEvent,
+    run_id: String,
+    reply: String,
+    memory_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateMemoryRequest {
+    kind: MemoryKind,
+    wing: String,
+    room: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolDecisionResponse {
+    tool: String,
+    decision: PolicyDecision,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolExecuteRequest {
+    channel: ChannelKind,
+    subject_id: Option<String>,
+    session_token: Option<String>,
+    confirmation_grant_id: Option<String>,
+    input: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolExecuteResponse {
+    run_id: String,
+    tool: String,
+    decision: PolicyDecision,
+    output: Option<Value>,
+    memory_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChannelPolicyResponse {
+    policies: Vec<ChannelPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VoiceTurnRequest {
+    text_hint: String,
+    voice: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VoiceTurnResponse {
+    transcript: Transcript,
+    reply: String,
+    audio: AudioBlob,
+}
+
+#[derive(Debug, Deserialize)]
+struct PutSecretRequest {
+    secret: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletePairingRequest {
+    session_id: String,
+    code: String,
+    label: String,
+    public_key: String,
+    signature: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueSessionRequest {
+    device_id: String,
+    subject_id: Option<String>,
+    timestamp_ms: u64,
+    nonce: String,
+    method: String,
+    path: String,
+    body_sha256: String,
+    signature: String,
+}
+
+#[derive(Debug, Serialize)]
+struct IssueSessionResponse {
+    session: AuthSession,
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyPassphraseRequest {
+    challenge_id: String,
+    spoken_phrase: String,
+    subject_id: String,
+    allowed_tool: String,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifyPassphraseResponse {
+    verified: bool,
+    grant: ConfirmationGrant,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReflectionRunRequest {
+    limit: Option<usize>,
+    allow_sensitive: Option<bool>,
+    allow_skill_generation: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCatalogResponse {
+    tools: Vec<ToolCatalogItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCatalogItem {
+    name: String,
+    description: String,
+    risk: RiskLevel,
+    requires_owner: bool,
+    requires_confirmation: bool,
+    input_schema: Value,
+    output_schema: Value,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "indwell_host_sim=info,tower_http=info".to_string()),
+        )
+        .init();
+
+    let data_root = std::env::var("INDWELL_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/host-sim"));
+    let memory = JsonlMemoryStore::new(data_root.join("memory"))?;
+    let runs = JsonlRunStore::new(data_root.join("runs"))?;
+    let providers = JsonProviderConfigStore::new(data_root.join("config"))?;
+    let ota = JsonOtaManifestStore::new(data_root.join("ota"))?;
+    let secrets = FileSealedSecretStore::new(
+        data_root.join("secrets"),
+        host_secret_store_key(std::env::var("INDWELL_HOST_SIM_SECRET_KEY").ok().as_deref()),
+    )?;
+    let paired_devices_store = JsonPairedDeviceStore::new(data_root.join("pairing/devices.json"))?;
+    let pairing = PairingManager::from_paired_devices(paired_devices_store.load()?);
+    let sessions = SessionTokenManager::new(host_secret_store_key(
+        std::env::var("INDWELL_HOST_SIM_SESSION_KEY")
+            .ok()
+            .as_deref(),
+    ));
+
+    let state = AppState {
+        memory: Arc::new(Mutex::new(memory)),
+        runs: Arc::new(Mutex::new(runs)),
+        providers: Arc::new(Mutex::new(providers)),
+        provisioning: Arc::new(Mutex::new(None)),
+        secrets: Arc::new(Mutex::new(secrets)),
+        pairing: Arc::new(Mutex::new(pairing)),
+        paired_devices: Arc::new(paired_devices_store),
+        sessions: Arc::new(Mutex::new(sessions)),
+        grants: Arc::new(Mutex::new(ConfirmationGrantManager::default())),
+        passphrases: Arc::new(Mutex::new(PassphraseChallengeManager::default())),
+        ota: Arc::new(Mutex::new(ota)),
+        context: Arc::new(ContextAssembler::default()),
+        policy: Arc::new(PolicyEngine),
+    };
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/v1/channel/input", post(channel_input))
+        .route("/v1/voice/mock-turn", post(mock_voice_turn))
+        .route("/v1/gateway/custom-webhook", post(custom_webhook_input))
+        .route("/v1/channels/policies", get(channel_policies))
+        .route("/v1/memory", post(create_memory))
+        .route("/v1/memory/export", get(export_memory))
+        .route("/v1/memory/metabolize", post(metabolize_memory))
+        .route("/v1/memory/search", post(search_memory))
+        .route("/v1/reflection/run", post(run_reflection))
+        .route(
+            "/v1/provisioning",
+            get(get_provisioning).post(save_provisioning),
+        )
+        .route("/v1/providers", get(get_providers).put(save_providers))
+        .route(
+            "/v1/secrets/:key_ref",
+            get(get_secret).put(put_secret).delete(delete_secret),
+        )
+        .route("/v1/pairing/challenge", post(issue_pairing_challenge))
+        .route("/v1/pairing/complete", post(complete_pairing))
+        .route("/v1/pairing/devices", get(list_paired_devices))
+        .route("/v1/pairing/devices/:id", delete(revoke_paired_device))
+        .route("/v1/auth/session", post(issue_auth_session))
+        .route(
+            "/v1/auth/passphrase/challenge",
+            post(issue_passphrase_challenge),
+        )
+        .route(
+            "/v1/auth/passphrase/verify",
+            post(verify_passphrase_challenge),
+        )
+        .route("/v1/ota/manifest", get(get_ota_manifest))
+        .route("/v1/ota/check", post(check_ota_manifest))
+        .route("/v1/ota/trust", get(get_ota_trust).put(save_ota_trust))
+        .route("/v1/runs", get(list_runs))
+        .route("/v1/runs/:id", get(get_run))
+        .route("/v1/tools", get(list_tools))
+        .route("/v1/tools/:tool/check", post(check_tool))
+        .route("/v1/tools/:tool/execute", post(execute_tool))
+        .with_state(state)
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http());
+
+    let addr: SocketAddr = std::env::var("INDWELL_HOST_SIM_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:3030".to_string())
+        .parse()?;
+    tracing::info!("Indwell host simulator listening on http://{addr}");
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+async fn health() -> Json<ApiEnvelope<HealthResponse>> {
+    Json(ApiEnvelope::ok(HealthResponse {
+        service: "indwell-host-sim",
+        status: "ok",
+    }))
+}
+
+async fn channel_input(
+    State(state): State<AppState>,
+    Json(req): Json<ChannelInputRequest>,
+) -> Result<Json<ApiEnvelope<ChannelInputResponse>>, AppError> {
+    let principal = match req.session_token.as_deref() {
+        Some(token) => Some(principal_from_session_token(&state, token).await?),
+        None => None,
+    };
+    handle_channel_event(
+        state,
+        ChannelInbound {
+            channel: req.channel,
+            session_id: req.session_id.clone(),
+            subject_hint: req.subject_hint,
+            principal,
+            text: req.text,
+            command: None,
+        },
+    )
+    .await
+}
+
+async fn custom_webhook_input(
+    State(state): State<AppState>,
+    Json(req): Json<CustomWebhookInputRequest>,
+) -> Result<Json<ApiEnvelope<ChannelInputResponse>>, AppError> {
+    handle_channel_event(state, req.into()).await
+}
+
+async fn mock_voice_turn(
+    State(state): State<AppState>,
+    Json(req): Json<VoiceTurnRequest>,
+) -> Result<Json<ApiEnvelope<VoiceTurnResponse>>, AppError> {
+    let providers = state.providers.lock().await.load()?;
+    let transcript = transcribe_with_config(
+        &state,
+        &providers,
+        AudioBlob {
+            bytes: req.text_hint.as_bytes().to_vec(),
+            mime_type: "audio/mock-text-hint".to_string(),
+            duration_ms: Some((req.text_hint.len() as u32).saturating_mul(40)),
+        },
+    )
+    .await?;
+    let api_key = match providers.llm.api_key_ref.as_deref() {
+        Some(key_ref) => resolve_api_key(&state, key_ref).await?,
+        None => None,
+    };
+    let reply = chat_with_config(
+        &providers,
+        api_key,
+        ChatRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: transcript.text.clone(),
+            }],
+        },
+    )
+    .await?
+    .text;
+    let audio = synthesize_with_config(
+        &state,
+        &providers,
+        &reply,
+        VoiceProfile {
+            voice: req.voice.unwrap_or_else(|| "warm_indwell".to_string()),
+            language: Some("en".to_string()),
+        },
+    )
+    .await?;
+
+    Ok(Json(ApiEnvelope::ok(VoiceTurnResponse {
+        transcript,
+        reply,
+        audio,
+    })))
+}
+
+async fn handle_channel_event(
+    state: AppState,
+    inbound: ChannelInbound,
+) -> Result<Json<ApiEnvelope<ChannelInputResponse>>, AppError> {
+    let auth_context = auth_context_for_inbound(&inbound);
+    let adapter = BasicChannelAdapter::new(inbound.channel);
+    let event = adapter.normalize_inbound(inbound)?;
+
+    let text = match &event {
+        ChannelEvent::UserText { text, .. } => text.clone(),
+        ChannelEvent::RemoteCommand { command, .. } => command_prompt(command),
+        _ => String::new(),
+    };
+    let mut run = AgentRun::new(
+        Event::ChannelMessage {
+            channel: format!("{:?}", event.channel()),
+            session_id: match &event {
+                ChannelEvent::UserText { session_id, .. }
+                | ChannelEvent::UserImage { session_id, .. }
+                | ChannelEvent::UserAudio { session_id, .. }
+                | ChannelEvent::Confirmation { session_id, .. }
+                | ChannelEvent::RemoteCommand { session_id, .. } => session_id.clone(),
+            },
+        },
+        Some(text.clone()),
+        auth_context,
+        DeviceState::Thinking,
+        ProviderSelection {
+            llm: "mock:phase0".to_string(),
+            vision: None,
+            asr: None,
+            tts: None,
+            embedding: None,
+        },
+        Utc::now().timestamp_millis() as u64,
+    );
+    run.audit.input_summary = Some(text.clone());
+
+    let memory_query = state.context.memory_query(&text);
+    let retrieved_memories = state.memory.lock().await.search(memory_query)?;
+    let assembly = state.context.assemble(
+        &text,
+        event.channel(),
+        retrieved_memories,
+        &state.policy,
+        &run.auth_context,
+    );
+    apply_context_pack(&mut run, DeviceState::Thinking, assembly);
+
+    let providers = state.providers.lock().await.load()?;
+    run.provider.llm = format!("{}:{}", providers.llm.kind, providers.llm.model);
+    let api_key = match providers.llm.api_key_ref.as_deref() {
+        Some(key_ref) => resolve_api_key(&state, key_ref).await?,
+        None => None,
+    };
+    let reply = chat_with_config(
+        &providers,
+        api_key,
+        ChatRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: text.clone(),
+            }],
+        },
+    )
+    .await?
+    .text;
+
+    let planned_tools = plan_tool_calls(&text, &run.allowed_tools);
+    for planned in planned_tools {
+        match execute_mock_tool(&state, &planned.tool, planned.input).await {
+            Ok(execution) => {
+                run.record_tool_call(
+                    &planned.tool,
+                    ToolAuditOutcome::Completed,
+                    format!("planned tool: {}", execution.summary),
+                );
+                if let Some(memory_id) = execution.memory_id {
+                    run.record_written_memory(memory_id);
+                }
+            }
+            Err(error) => {
+                run.record_tool_call(
+                    &planned.tool,
+                    ToolAuditOutcome::Failed,
+                    format!("planned tool failed: {error:?}"),
+                );
+            }
+        }
+    }
+
+    let memory_id = if !text.trim().is_empty() {
+        let mut record = MemoryRecord::new(
+            MemoryKind::Episodic,
+            "user_unknown",
+            "episodes",
+            format!("{} -> {}", text, reply),
+            MemorySource::AgentRun {
+                run_id: run.id.to_string(),
+            },
+            Utc::now().timestamp_millis() as u64,
+        );
+        record.tags.push(format!("channel:{:?}", event.channel()));
+        let id = record.id.clone();
+        state.memory.lock().await.append(record)?;
+        run.record_written_memory(id.clone());
+        Some(id)
+    } else {
+        None
+    };
+    run.finish_with_summary(reply.clone(), Utc::now().timestamp_millis() as u64);
+    state.runs.lock().await.append(&run)?;
+
+    Ok(Json(ApiEnvelope::ok(ChannelInputResponse {
+        event,
+        run_id: run.id.to_string(),
+        reply,
+        memory_id,
+    })))
+}
+
+fn auth_context_for_inbound(inbound: &ChannelInbound) -> AuthContext {
+    if let Some(principal) = &inbound.principal {
+        if principal.owner_authenticated {
+            return AuthContext::owner(&principal.subject_id, vec![AuthMethod::PairedDevice]);
+        }
+        AuthContext {
+            subject_id: Some(principal.subject_id.clone()),
+            owner_authenticated: false,
+            methods: vec![],
+        }
+    } else {
+        AuthContext::anonymous()
+    }
+}
+
+async fn principal_from_session_token(
+    state: &AppState,
+    token: &str,
+) -> Result<ChannelPrincipal, AppError> {
+    let session = state
+        .sessions
+        .lock()
+        .await
+        .verify(token, Utc::now().timestamp_millis() as u64)?;
+    Ok(ChannelPrincipal {
+        subject_id: session.subject_id,
+        owner_authenticated: true,
+    })
+}
+
+fn command_prompt(command: &MobileCommand) -> String {
+    match command {
+        MobileCommand::SendText { text } => text.clone(),
+        MobileCommand::CaptureImage => "capture camera image".to_string(),
+        MobileCommand::SearchMemory { query } => format!("search memory {query}"),
+        MobileCommand::DeleteMemory { id } => format!("delete memory {id}"),
+        MobileCommand::SystemStatus => "system status".to_string(),
+        MobileCommand::CheckUpdate => "check update".to_string(),
+        MobileCommand::ApplyUpdate { version } => format!("apply update {version}"),
+    }
+}
+
+async fn chat_with_config(
+    providers: &ProviderConfigSet,
+    api_key: Option<String>,
+    req: ChatRequest,
+) -> Result<indwell_provider::ChatResponse, AppError> {
+    match providers.llm.kind.as_str() {
+        "mock" => Ok(MockLlmProvider.chat(req).await?),
+        "openai_compatible" => {
+            let api_key_ref = providers
+                .llm
+                .api_key_ref
+                .clone()
+                .unwrap_or_else(|| "key_llm_main".to_string());
+            let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+                base_url: providers.llm.base_url.clone().unwrap_or_default(),
+                api_key: api_key.or_else(|| resolve_api_key_from_env(&api_key_ref)),
+                api_key_ref,
+                model: providers.llm.model.clone(),
+                max_input_tokens: providers.llm.max_input_tokens,
+                max_output_tokens: providers.llm.max_output_tokens,
+            });
+            Ok(provider.chat(req).await?)
+        }
+        other => Err(AppError::UnsupportedProviderKind(other.to_string())),
+    }
+}
+
+async fn transcribe_with_config(
+    state: &AppState,
+    providers: &ProviderConfigSet,
+    audio: AudioBlob,
+) -> Result<Transcript, AppError> {
+    let Some(config) = providers.asr.as_ref() else {
+        return Ok(MockAsrProvider.transcribe(audio).await?);
+    };
+    match config.kind.as_str() {
+        "mock" => Ok(MockAsrProvider.transcribe(audio).await?),
+        "same_as_llm" | "openai_compatible" => {
+            let resolved = provider_config_with_llm_fallback(config, &providers.llm);
+            let api_key = match resolved.api_key_ref.as_deref() {
+                Some(key_ref) => resolve_api_key(state, key_ref).await?,
+                None => None,
+            };
+            let provider = openai_provider_from_config(&resolved, api_key);
+            Ok(provider.transcribe(audio).await?)
+        }
+        other => Err(AppError::UnsupportedProviderKind(other.to_string())),
+    }
+}
+
+async fn synthesize_with_config(
+    state: &AppState,
+    providers: &ProviderConfigSet,
+    text: &str,
+    voice: VoiceProfile,
+) -> Result<AudioBlob, AppError> {
+    let Some(config) = providers.tts.as_ref() else {
+        return Ok(MockTtsProvider.synthesize(text, voice).await?);
+    };
+    match config.kind.as_str() {
+        "mock" => Ok(MockTtsProvider.synthesize(text, voice).await?),
+        "same_as_llm" | "openai_compatible" => {
+            let resolved = provider_config_with_llm_fallback(config, &providers.llm);
+            let api_key = match resolved.api_key_ref.as_deref() {
+                Some(key_ref) => resolve_api_key(state, key_ref).await?,
+                None => None,
+            };
+            let provider = openai_provider_from_config(&resolved, api_key);
+            Ok(provider.synthesize(text, voice).await?)
+        }
+        other => Err(AppError::UnsupportedProviderKind(other.to_string())),
+    }
+}
+
+fn provider_config_with_llm_fallback(
+    config: &ProviderConfig,
+    llm: &ProviderConfig,
+) -> ProviderConfig {
+    ProviderConfig {
+        kind: if config.kind == "same_as_llm" {
+            llm.kind.clone()
+        } else {
+            config.kind.clone()
+        },
+        base_url: config.base_url.clone().or_else(|| llm.base_url.clone()),
+        api_key_ref: config
+            .api_key_ref
+            .clone()
+            .or_else(|| llm.api_key_ref.clone()),
+        model: if config.model.trim().is_empty() {
+            llm.model.clone()
+        } else {
+            config.model.clone()
+        },
+        max_input_tokens: config.max_input_tokens.or(llm.max_input_tokens),
+        max_output_tokens: config.max_output_tokens.or(llm.max_output_tokens),
+    }
+}
+
+fn openai_provider_from_config(
+    config: &ProviderConfig,
+    api_key: Option<String>,
+) -> OpenAiCompatibleProvider {
+    OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+        base_url: config.base_url.clone().unwrap_or_default(),
+        api_key: api_key.or_else(|| {
+            config
+                .api_key_ref
+                .as_deref()
+                .and_then(resolve_api_key_from_env)
+        }),
+        api_key_ref: config
+            .api_key_ref
+            .clone()
+            .unwrap_or_else(|| "key_llm_main".to_string()),
+        model: config.model.clone(),
+        max_input_tokens: config.max_input_tokens,
+        max_output_tokens: config.max_output_tokens,
+    })
+}
+
+async fn resolve_api_key(state: &AppState, api_key_ref: &str) -> Result<Option<String>, AppError> {
+    let stored = state.secrets.lock().await.get(api_key_ref)?;
+    Ok(stored
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .or_else(|| resolve_api_key_from_env(api_key_ref)))
+}
+
+fn host_secret_store_key(seed: Option<&str>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let seed = seed.unwrap_or("indwell-host-sim-local-development-key");
+    Sha256::digest(seed.as_bytes()).into()
+}
+
+fn resolve_api_key_from_env(api_key_ref: &str) -> Option<String> {
+    let env_name = api_key_env_name(api_key_ref);
+    std::env::var(env_name).ok()
+}
+
+fn api_key_env_name(api_key_ref: &str) -> String {
+    let suffix = api_key_ref
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("INDWELL_SECRET_{suffix}")
+}
+
+fn decode_hex_or_utf8(value: &str) -> Result<Vec<u8>, AppError> {
+    let trimmed = value.trim();
+    if trimmed.len() % 2 == 0 && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let mut out = Vec::with_capacity(trimmed.len() / 2);
+        for chunk in trimmed.as_bytes().chunks_exact(2) {
+            let hi = hex_value(chunk[0])?;
+            let lo = hex_value(chunk[1])?;
+            out.push((hi << 4) | lo);
+        }
+        return Ok(out);
+    }
+    Ok(trimmed.as_bytes().to_vec())
+}
+
+fn hex_value(byte: u8) -> Result<u8, AppError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(AppError::InvalidHex),
+    }
+}
+
+async fn create_memory(
+    State(state): State<AppState>,
+    Json(req): Json<CreateMemoryRequest>,
+) -> Result<Json<ApiEnvelope<MemoryRecord>>, AppError> {
+    let record = MemoryRecord::new(
+        req.kind,
+        req.wing,
+        req.room,
+        req.content,
+        MemorySource::Manual,
+        Utc::now().timestamp_millis() as u64,
+    );
+    state.memory.lock().await.append(record.clone())?;
+    Ok(Json(ApiEnvelope::ok(record)))
+}
+
+async fn export_memory(
+    State(state): State<AppState>,
+) -> Result<Json<ApiEnvelope<MemoryExport>>, AppError> {
+    let export = state.memory.lock().await.export()?;
+    Ok(Json(ApiEnvelope::ok(export)))
+}
+
+async fn search_memory(
+    State(state): State<AppState>,
+    Json(query): Json<MemoryQuery>,
+) -> Result<Json<ApiEnvelope<Vec<MemoryRecord>>>, AppError> {
+    let records = state.memory.lock().await.search(query)?;
+    Ok(Json(ApiEnvelope::ok(records)))
+}
+
+async fn metabolize_memory(
+    State(state): State<AppState>,
+) -> Result<Json<ApiEnvelope<MemoryMetabolismReport>>, AppError> {
+    let report = state
+        .memory
+        .lock()
+        .await
+        .metabolize(Utc::now().timestamp_millis() as u64)?;
+    Ok(Json(ApiEnvelope::ok(report)))
+}
+
+async fn run_reflection(
+    State(state): State<AppState>,
+    Json(req): Json<ReflectionRunRequest>,
+) -> Result<Json<ApiEnvelope<ReflectionReport>>, AppError> {
+    let source_records = state.memory.lock().await.search(MemoryQuery {
+        wing: None,
+        room: Some("episodes".to_string()),
+        text: None,
+        limit: Some(req.limit.unwrap_or(20)),
+    })?;
+    let report = ReflectionEngine.reflect(indwell_reflection::ReflectionInput {
+        source_records,
+        now_ms: Utc::now().timestamp_millis() as u64,
+        budget: ReflectionBudget {
+            max_new_memories: 8,
+            allow_sensitive: req.allow_sensitive.unwrap_or(false),
+            allow_skill_generation: req.allow_skill_generation.unwrap_or(true),
+        },
+    })?;
+
+    {
+        let mut memory = state.memory.lock().await;
+        for record in &report.new_memories {
+            memory.append(record.clone())?;
+        }
+        for skill in &report.skills {
+            let record = MemoryRecord::new(
+                MemoryKind::Skill,
+                "user_unknown",
+                "learning",
+                serde_json::to_string(skill)?,
+                MemorySource::Reflection,
+                Utc::now().timestamp_millis() as u64,
+            );
+            memory.append(record)?;
+        }
+    }
+
+    Ok(Json(ApiEnvelope::ok(report)))
+}
+
+async fn save_provisioning(
+    State(state): State<AppState>,
+    Json(req): Json<ProvisioningRequest>,
+) -> Result<Json<ApiEnvelope<ProvisioningResponse>>, AppError> {
+    state.providers.lock().await.save(&req.providers)?;
+    *state.provisioning.lock().await = Some(req.clone());
+    Ok(Json(ApiEnvelope::ok(ProvisioningResponse {
+        accepted: true,
+        next_state: DeviceState::Idle,
+        message: format!("provisioning accepted for {}", req.device_id),
+    })))
+}
+
+async fn get_provisioning(
+    State(state): State<AppState>,
+) -> Json<ApiEnvelope<Option<ProvisioningRequest>>> {
+    Json(ApiEnvelope::ok(state.provisioning.lock().await.clone()))
+}
+
+async fn get_providers(
+    State(state): State<AppState>,
+) -> Result<Json<ApiEnvelope<ProviderConfigSet>>, AppError> {
+    let providers = state.providers.lock().await.load()?;
+    Ok(Json(ApiEnvelope::ok(providers)))
+}
+
+async fn save_providers(
+    State(state): State<AppState>,
+    Json(config): Json<ProviderConfigSet>,
+) -> Result<Json<ApiEnvelope<ProviderConfigSet>>, AppError> {
+    state.providers.lock().await.save(&config)?;
+    Ok(Json(ApiEnvelope::ok(config)))
+}
+
+async fn put_secret(
+    State(state): State<AppState>,
+    Path(key_ref): Path<String>,
+    Json(req): Json<PutSecretRequest>,
+) -> Result<Json<ApiEnvelope<StoredSecret>>, AppError> {
+    let stored = state.secrets.lock().await.put(
+        key_ref,
+        req.secret.as_bytes(),
+        Utc::now().timestamp_millis() as u64,
+    )?;
+    Ok(Json(ApiEnvelope::ok(stored)))
+}
+
+async fn get_secret(
+    State(state): State<AppState>,
+    Path(key_ref): Path<String>,
+) -> Result<Json<ApiEnvelope<Option<StoredSecret>>>, AppError> {
+    let stored = state.secrets.lock().await.describe(&key_ref)?;
+    Ok(Json(ApiEnvelope::ok(stored)))
+}
+
+async fn delete_secret(
+    State(state): State<AppState>,
+    Path(key_ref): Path<String>,
+) -> Result<Json<ApiEnvelope<bool>>, AppError> {
+    let deleted = state.secrets.lock().await.delete(&key_ref)?;
+    Ok(Json(ApiEnvelope::ok(deleted)))
+}
+
+async fn issue_pairing_challenge(
+    State(state): State<AppState>,
+) -> Json<ApiEnvelope<PairingChallenge>> {
+    let challenge = state
+        .pairing
+        .lock()
+        .await
+        .issue_challenge(Utc::now().timestamp_millis() as u64, 120_000);
+    Json(ApiEnvelope::ok(challenge))
+}
+
+async fn complete_pairing(
+    State(state): State<AppState>,
+    Json(req): Json<CompletePairingRequest>,
+) -> Result<Json<ApiEnvelope<PairedDevice>>, AppError> {
+    let public_key = decode_hex_or_utf8(&req.public_key)?;
+    let paired = if let Some(signature) = req.signature {
+        let signature = decode_hex_or_utf8(&signature)?;
+        state.pairing.lock().await.complete_pairing_signed(
+            &req.session_id,
+            &req.code,
+            req.label,
+            &public_key,
+            &signature,
+            Utc::now().timestamp_millis() as u64,
+        )?
+    } else {
+        state.pairing.lock().await.complete_pairing(
+            &req.session_id,
+            &req.code,
+            req.label,
+            &public_key,
+            Utc::now().timestamp_millis() as u64,
+        )?
+    };
+    persist_paired_devices(&state).await?;
+    Ok(Json(ApiEnvelope::ok(paired)))
+}
+
+async fn list_paired_devices(
+    State(state): State<AppState>,
+) -> Json<ApiEnvelope<Vec<PairedDevice>>> {
+    Json(ApiEnvelope::ok(state.pairing.lock().await.paired_devices()))
+}
+
+async fn revoke_paired_device(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiEnvelope<PairedDevice>>, AppError> {
+    let paired = state
+        .pairing
+        .lock()
+        .await
+        .revoke(&id, Utc::now().timestamp_millis() as u64)?;
+    persist_paired_devices(&state).await?;
+    Ok(Json(ApiEnvelope::ok(paired)))
+}
+
+async fn issue_auth_session(
+    State(state): State<AppState>,
+    Json(req): Json<IssueSessionRequest>,
+) -> Result<Json<ApiEnvelope<IssueSessionResponse>>, AppError> {
+    let now_ms = Utc::now().timestamp_millis() as u64;
+    let signature = decode_hex_or_utf8(&req.signature)?;
+    let signed = SignedRequest {
+        device_id: req.device_id.clone(),
+        timestamp_ms: req.timestamp_ms,
+        nonce: req.nonce,
+        method: req.method,
+        path: req.path,
+        body_sha256: req.body_sha256,
+    };
+    let mut pairing = state.pairing.lock().await;
+    let device = pairing
+        .paired_devices()
+        .into_iter()
+        .find(|device| device.device_id == req.device_id)
+        .ok_or(AppError::UnknownPairedDevice)?;
+    indwell_security::verify_signed_request(&device, &signed, &signature, now_ms, 5 * 60 * 1000)?;
+    let device = pairing.mark_seen(&req.device_id, now_ms)?;
+    drop(pairing);
+    persist_paired_devices(&state).await?;
+    let (session, token) = state.sessions.lock().await.issue(
+        &device,
+        req.subject_id.unwrap_or_else(|| "owner".to_string()),
+        now_ms,
+        24 * 60 * 60 * 1000,
+    )?;
+    Ok(Json(ApiEnvelope::ok(IssueSessionResponse {
+        session,
+        token,
+    })))
+}
+
+async fn persist_paired_devices(state: &AppState) -> Result<(), AppError> {
+    let devices = state.pairing.lock().await.paired_devices();
+    state.paired_devices.save(&devices)?;
+    Ok(())
+}
+
+async fn issue_passphrase_challenge(
+    State(state): State<AppState>,
+) -> Json<ApiEnvelope<PassphraseChallenge>> {
+    let challenge = state
+        .passphrases
+        .lock()
+        .await
+        .issue(Utc::now().timestamp_millis() as u64, 120_000);
+    Json(ApiEnvelope::ok(challenge))
+}
+
+async fn verify_passphrase_challenge(
+    State(state): State<AppState>,
+    Json(req): Json<VerifyPassphraseRequest>,
+) -> Result<Json<ApiEnvelope<VerifyPassphraseResponse>>, AppError> {
+    let now_ms = Utc::now().timestamp_millis() as u64;
+    state
+        .passphrases
+        .lock()
+        .await
+        .verify(&req.challenge_id, &req.spoken_phrase, now_ms)?;
+    let grant =
+        state
+            .grants
+            .lock()
+            .await
+            .issue(req.subject_id, req.allowed_tool, now_ms, 5 * 60 * 1000);
+    Ok(Json(ApiEnvelope::ok(VerifyPassphraseResponse {
+        verified: true,
+        grant,
+    })))
+}
+
+async fn get_ota_manifest(
+    State(state): State<AppState>,
+) -> Result<Json<ApiEnvelope<OtaManifest>>, AppError> {
+    let manifest = state.ota.lock().await.load()?;
+    Ok(Json(ApiEnvelope::ok(manifest)))
+}
+
+async fn check_ota_manifest(
+    State(state): State<AppState>,
+) -> Result<Json<ApiEnvelope<OtaVerificationReport>>, AppError> {
+    let report = state.ota.lock().await.verify("host-sim")?;
+    Ok(Json(ApiEnvelope::ok(report)))
+}
+
+async fn get_ota_trust(
+    State(state): State<AppState>,
+) -> Result<Json<ApiEnvelope<OtaTrustStore>>, AppError> {
+    let trust = state.ota.lock().await.load_trust_store()?;
+    Ok(Json(ApiEnvelope::ok(trust)))
+}
+
+async fn save_ota_trust(
+    State(state): State<AppState>,
+    Json(trust): Json<OtaTrustStore>,
+) -> Result<Json<ApiEnvelope<OtaTrustStore>>, AppError> {
+    state.ota.lock().await.save_trust_store(&trust)?;
+    Ok(Json(ApiEnvelope::ok(trust)))
+}
+
+async fn list_runs(
+    State(state): State<AppState>,
+) -> Result<Json<ApiEnvelope<Vec<AgentRun>>>, AppError> {
+    let runs = state.runs.lock().await.list()?;
+    Ok(Json(ApiEnvelope::ok(runs)))
+}
+
+async fn get_run(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiEnvelope<Option<AgentRun>>>, AppError> {
+    let run = state.runs.lock().await.get(id)?;
+    Ok(Json(ApiEnvelope::ok(run)))
+}
+
+async fn list_tools() -> Json<ApiEnvelope<ToolCatalogResponse>> {
+    Json(ApiEnvelope::ok(ToolCatalogResponse {
+        tools: default_tools()
+            .into_iter()
+            .map(|tool| ToolCatalogItem {
+                input_schema: tool_input_schema(&tool.name),
+                output_schema: tool_output_schema(&tool.name),
+                name: tool.name,
+                description: tool.description,
+                risk: tool.risk,
+                requires_owner: tool.requires_owner,
+                requires_confirmation: tool.requires_confirmation,
+            })
+            .collect(),
+    }))
+}
+
+async fn check_tool(
+    State(state): State<AppState>,
+    Path(tool): Path<String>,
+    Json(channel): Json<ChannelKind>,
+) -> Json<ApiEnvelope<ToolDecisionResponse>> {
+    let descriptor = default_tools()
+        .into_iter()
+        .find(|candidate| candidate.name == tool)
+        .unwrap_or_else(|| {
+            ToolDescriptor::new(tool.clone(), "Unknown tool.", RiskLevel::Forbidden)
+        });
+    let policy = ChannelPolicy::default_for(channel);
+    let decision = state
+        .policy
+        .evaluate_tool(&descriptor, &AuthContext::anonymous(), &policy);
+
+    Json(ApiEnvelope::ok(ToolDecisionResponse { tool, decision }))
+}
+
+async fn execute_tool(
+    State(state): State<AppState>,
+    Path(tool): Path<String>,
+    Json(req): Json<ToolExecuteRequest>,
+) -> Result<Json<ApiEnvelope<ToolExecuteResponse>>, AppError> {
+    let descriptor = default_tools()
+        .into_iter()
+        .find(|candidate| candidate.name == tool)
+        .unwrap_or_else(|| {
+            ToolDescriptor::new(tool.clone(), "Unknown tool.", RiskLevel::Forbidden)
+        });
+    let channel_policy = ChannelPolicy::default_for(req.channel);
+    let auth = if let Some(token) = req.session_token.as_deref() {
+        let session = state
+            .sessions
+            .lock()
+            .await
+            .verify(token, Utc::now().timestamp_millis() as u64)?;
+        AuthContext::owner(
+            session.subject_id,
+            vec![indwell_core::AuthMethod::PairedDevice],
+        )
+    } else {
+        match req.subject_id {
+            Some(subject_id) => AuthContext {
+                subject_id: Some(subject_id),
+                owner_authenticated: false,
+                methods: vec![],
+            },
+            None => AuthContext::anonymous(),
+        }
+    };
+    let decision = state
+        .policy
+        .evaluate_tool(&descriptor, &auth, &channel_policy);
+
+    let now = Utc::now().timestamp_millis() as u64;
+    let mut run = AgentRun::new(
+        Event::ToolCallRequested {
+            run_id: "host-sim-direct-tool".to_string(),
+            tool: tool.clone(),
+        },
+        Some(format!("execute tool {tool}")),
+        auth,
+        DeviceState::Thinking,
+        ProviderSelection {
+            llm: "mock:phase0".to_string(),
+            vision: None,
+            asr: None,
+            tts: None,
+            embedding: None,
+        },
+        now,
+    );
+    run.allowed_tools.push(descriptor.clone());
+
+    if decision != PolicyDecision::Allow {
+        let summary = format!("blocked by policy: {decision:?}");
+        run.record_tool_call(&tool, ToolAuditOutcome::Blocked, summary.clone());
+        run.record_policy_block(summary);
+        state.runs.lock().await.append(&run)?;
+        return Ok(Json(ApiEnvelope::ok(ToolExecuteResponse {
+            run_id: run.id.to_string(),
+            tool,
+            decision,
+            output: None,
+            memory_id: None,
+        })));
+    }
+
+    if descriptor.requires_confirmation {
+        let subject_id = run
+            .auth_context
+            .subject_id
+            .as_deref()
+            .unwrap_or("anonymous");
+        let Some(grant_id) = req.confirmation_grant_id.as_deref() else {
+            let summary = "missing confirmation grant for high-risk tool".to_string();
+            run.record_tool_call(&tool, ToolAuditOutcome::Blocked, summary.clone());
+            run.record_policy_block(summary);
+            state.runs.lock().await.append(&run)?;
+            return Ok(Json(ApiEnvelope::ok(ToolExecuteResponse {
+                run_id: run.id.to_string(),
+                tool,
+                decision: PolicyDecision::RequireConfirmation,
+                output: None,
+                memory_id: None,
+            })));
+        };
+        if let Err(err) = state.grants.lock().await.consume(
+            grant_id,
+            subject_id,
+            &tool,
+            Utc::now().timestamp_millis() as u64,
+        ) {
+            let summary = format!("confirmation grant rejected: {err}");
+            run.record_tool_call(&tool, ToolAuditOutcome::Blocked, summary.clone());
+            run.record_policy_block(summary);
+            state.runs.lock().await.append(&run)?;
+            return Ok(Json(ApiEnvelope::ok(ToolExecuteResponse {
+                run_id: run.id.to_string(),
+                tool,
+                decision: PolicyDecision::RequireConfirmation,
+                output: None,
+                memory_id: None,
+            })));
+        }
+    }
+
+    let execution =
+        execute_mock_tool(&state, &tool, req.input.unwrap_or_else(|| json!({}))).await?;
+    run.record_tool_call(
+        &tool,
+        ToolAuditOutcome::Completed,
+        execution.summary.clone(),
+    );
+    if let Some(memory_id) = &execution.memory_id {
+        run.record_written_memory(memory_id.clone());
+    }
+    run.finish_with_summary(execution.summary, Utc::now().timestamp_millis() as u64);
+    state.runs.lock().await.append(&run)?;
+
+    Ok(Json(ApiEnvelope::ok(ToolExecuteResponse {
+        run_id: run.id.to_string(),
+        tool,
+        decision,
+        output: Some(execution.output),
+        memory_id: execution.memory_id,
+    })))
+}
+
+#[derive(Debug)]
+struct ToolExecution {
+    output: Value,
+    memory_id: Option<String>,
+    summary: String,
+}
+
+async fn execute_mock_tool(
+    state: &AppState,
+    tool: &str,
+    input: Value,
+) -> Result<ToolExecution, AppError> {
+    match tool {
+        "system.status" => {
+            let providers = state.providers.lock().await.load()?;
+            Ok(ToolExecution {
+                output: json!({
+                    "state": "idle",
+                    "network": "host-sim",
+                    "provider": {
+                        "kind": providers.llm.kind,
+                        "model": providers.llm.model,
+                    },
+                    "memory_backend": "jsonl",
+                }),
+                memory_id: None,
+                summary: "returned host simulator status".to_string(),
+            })
+        }
+        "device.led.set" => {
+            let color = input
+                .get("color")
+                .and_then(Value::as_str)
+                .unwrap_or("green");
+            Ok(ToolExecution {
+                output: json!({
+                    "accepted": true,
+                    "simulated": true,
+                    "color": color,
+                }),
+                memory_id: None,
+                summary: format!("simulated LED color {color}"),
+            })
+        }
+        "device.speaker.speak" => {
+            let text = input.get("text").and_then(Value::as_str).unwrap_or("");
+            Ok(ToolExecution {
+                output: json!({
+                    "accepted": true,
+                    "simulated": true,
+                    "text": text,
+                }),
+                memory_id: None,
+                summary: "simulated speaker output".to_string(),
+            })
+        }
+        "device.camera.capture" => Ok(ToolExecution {
+            output: json!({
+                "accepted": true,
+                "simulated": true,
+                "path": "data/host-sim/camera/latest.jpg",
+                "width": 640,
+                "height": 480,
+                "retention": "temporary",
+            }),
+            memory_id: None,
+            summary: "simulated still image capture".to_string(),
+        }),
+        "device.sensor.read" => {
+            let sensor = input
+                .get("sensor")
+                .and_then(Value::as_str)
+                .unwrap_or("ambient_light");
+            let value = match sensor {
+                "temperature" => json!({ "celsius": 24.2 }),
+                "imu" => json!({ "motion": "stable" }),
+                "pressure" => json!({ "pressed": false }),
+                _ => json!({ "lux": 320 }),
+            };
+            Ok(ToolExecution {
+                output: json!({
+                    "sensor": sensor,
+                    "value": value,
+                    "simulated": true,
+                }),
+                memory_id: None,
+                summary: format!("read simulated sensor {sensor}"),
+            })
+        }
+        "memory.search" => {
+            let query = MemoryQuery {
+                wing: input
+                    .get("wing")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                room: input
+                    .get("room")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                text: input
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                limit: input
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|limit| limit as usize),
+            };
+            let records = state.memory.lock().await.search(query)?;
+            Ok(ToolExecution {
+                output: json!({ "records": records }),
+                memory_id: None,
+                summary: "searched local memory".to_string(),
+            })
+        }
+        "memory.write_candidate" => {
+            let content = input
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("empty candidate memory");
+            let wing = input
+                .get("wing")
+                .and_then(Value::as_str)
+                .unwrap_or("user_unknown");
+            let room = input
+                .get("room")
+                .and_then(Value::as_str)
+                .unwrap_or("episodes");
+            let record = MemoryRecord::new(
+                MemoryKind::Episodic,
+                wing,
+                room,
+                content,
+                MemorySource::DeviceEvent,
+                Utc::now().timestamp_millis() as u64,
+            );
+            let memory_id = record.id.clone();
+            state.memory.lock().await.append(record)?;
+            Ok(ToolExecution {
+                output: json!({
+                    "accepted": true,
+                    "memory_id": memory_id,
+                }),
+                memory_id: Some(memory_id),
+                summary: "wrote candidate memory".to_string(),
+            })
+        }
+        "memory.delete" => {
+            let id = input.get("id").and_then(Value::as_str).unwrap_or("");
+            if id.is_empty() {
+                return Ok(ToolExecution {
+                    output: json!({
+                        "deleted": false,
+                        "reason": "missing memory id",
+                    }),
+                    memory_id: None,
+                    summary: "memory delete missing id".to_string(),
+                });
+            }
+            state.memory.lock().await.delete(id)?;
+            Ok(ToolExecution {
+                output: json!({
+                    "deleted": true,
+                    "memory_id": id,
+                }),
+                memory_id: None,
+                summary: format!("deleted memory {id}"),
+            })
+        }
+        "identity.whoami" => Ok(ToolExecution {
+            output: json!({
+                "subject_id": "unknown",
+                "owner_authenticated": false,
+                "method": "none",
+            }),
+            memory_id: None,
+            summary: "returned anonymous identity context".to_string(),
+        }),
+        "auth.request_confirmation" => Ok(ToolExecution {
+            output: json!({
+                "requested": true,
+                "channels": ["local_pwa", "physical_button"],
+                "challenge": "host-sim-confirm",
+            }),
+            memory_id: None,
+            summary: "simulated human confirmation request".to_string(),
+        }),
+        "system.update.check" => Ok(ToolExecution {
+            output: {
+                let manifest = state.ota.lock().await.load()?;
+                let report = indwell_ota::verify_manifest_shape(&manifest, "host-sim");
+                json!({
+                    "update_available": false,
+                    "current_version": "0.1.0-host-sim",
+                    "manifest": manifest,
+                    "verification": report,
+                })
+            },
+            memory_id: None,
+            summary: "checked mock update manifest".to_string(),
+        }),
+        "system.update.apply" => {
+            let manifest = state.ota.lock().await.load()?;
+            let plan =
+                indwell_ota::plan_ota_apply(&manifest, "host-sim", "0.1.0-host-sim", OtaSlot::Ota0)
+                    .map_err(AppError::OtaCore)?;
+            Ok(ToolExecution {
+                output: json!({
+                    "accepted": true,
+                    "simulated": true,
+                    "plan": plan,
+                    "next_state": "updating",
+                }),
+                memory_id: None,
+                summary: "simulated verified OTA apply plan".to_string(),
+            })
+        }
+        _ => Ok(ToolExecution {
+            output: json!({
+                "accepted": false,
+                "simulated": true,
+                "reason": "no mock executor implemented for this tool",
+            }),
+            memory_id: None,
+            summary: "no mock executor implemented".to_string(),
+        }),
+    }
+}
+
+async fn channel_policies() -> Json<ApiEnvelope<ChannelPolicyResponse>> {
+    let channels = [
+        ChannelKind::LocalPwa,
+        ChannelKind::Ble,
+        ChannelKind::UsbSerial,
+        ChannelKind::LanWebSocket,
+        ChannelKind::Telegram,
+        ChannelKind::Feishu,
+        ChannelKind::Dingtalk,
+        ChannelKind::WeCom,
+        ChannelKind::WhatsApp,
+        ChannelKind::Discord,
+        ChannelKind::Matrix,
+        ChannelKind::Mqtt,
+        ChannelKind::HomeAssistant,
+        ChannelKind::CustomWebhook,
+    ];
+
+    Json(ApiEnvelope::ok(ChannelPolicyResponse {
+        policies: channels
+            .into_iter()
+            .map(ChannelPolicy::default_for)
+            .collect(),
+    }))
+}
+
+fn tool_input_schema(tool: &str) -> Value {
+    match tool {
+        "device.led.set" => json!({
+            "type": "object",
+            "properties": { "color": { "type": "string" } },
+            "required": ["color"],
+        }),
+        "device.speaker.speak" => json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+            "required": ["text"],
+        }),
+        "memory.search" => json!({
+            "type": "object",
+            "properties": {
+                "wing": { "type": ["string", "null"] },
+                "room": { "type": ["string", "null"] },
+                "text": { "type": ["string", "null"] },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+            },
+        }),
+        "memory.write_candidate" => json!({
+            "type": "object",
+            "properties": {
+                "wing": { "type": "string" },
+                "room": { "type": "string" },
+                "content": { "type": "string" }
+            },
+            "required": ["content"],
+        }),
+        "memory.delete" => json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+        }),
+        "device.sensor.read" => json!({
+            "type": "object",
+            "properties": { "sensor": { "type": "string" } },
+        }),
+        _ => json!({ "type": "object" }),
+    }
+}
+
+fn tool_output_schema(tool: &str) -> Value {
+    match tool {
+        "system.status" => json!({
+            "type": "object",
+            "properties": {
+                "state": { "type": "string" },
+                "network": { "type": "string" },
+                "provider": { "type": "object" },
+                "memory_backend": { "type": "string" }
+            }
+        }),
+        "system.update.check" => json!({
+            "type": "object",
+            "properties": {
+                "update_available": { "type": "boolean" },
+                "current_version": { "type": "string" },
+                "manifest": { "type": "object" },
+                "verification": { "type": "object" }
+            }
+        }),
+        "device.camera.capture" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "width": { "type": "integer" },
+                "height": { "type": "integer" },
+                "retention": { "type": "string" }
+            }
+        }),
+        "device.sensor.read" => json!({
+            "type": "object",
+            "properties": {
+                "sensor": { "type": "string" },
+                "value": { "type": "object" }
+            }
+        }),
+        _ => json!({ "type": "object" }),
+    }
+}
+
+#[derive(Debug)]
+enum AppError {
+    Channel(indwell_channel::ChannelError),
+    Memory(indwell_memory::MemoryError),
+    Provider(indwell_provider::ProviderError),
+    ProviderConfig(provider_config::ProviderConfigStoreError),
+    Ota(ota::OtaManifestStoreError),
+    OtaCore(indwell_ota::OtaError),
+    RunStore(indwell_runs::RunStoreError),
+    Security(indwell_security::SecurityError),
+    Reflection(indwell_reflection::ReflectionError),
+    Json(serde_json::Error),
+    UnsupportedProviderKind(String),
+    InvalidHex,
+    UnknownPairedDevice,
+}
+
+impl From<indwell_channel::ChannelError> for AppError {
+    fn from(err: indwell_channel::ChannelError) -> Self {
+        Self::Channel(err)
+    }
+}
+
+impl From<indwell_memory::MemoryError> for AppError {
+    fn from(err: indwell_memory::MemoryError) -> Self {
+        Self::Memory(err)
+    }
+}
+
+impl From<indwell_provider::ProviderError> for AppError {
+    fn from(err: indwell_provider::ProviderError) -> Self {
+        Self::Provider(err)
+    }
+}
+
+impl From<provider_config::ProviderConfigStoreError> for AppError {
+    fn from(err: provider_config::ProviderConfigStoreError) -> Self {
+        Self::ProviderConfig(err)
+    }
+}
+
+impl From<ota::OtaManifestStoreError> for AppError {
+    fn from(err: ota::OtaManifestStoreError) -> Self {
+        Self::Ota(err)
+    }
+}
+
+impl From<indwell_runs::RunStoreError> for AppError {
+    fn from(err: indwell_runs::RunStoreError) -> Self {
+        Self::RunStore(err)
+    }
+}
+
+impl From<indwell_security::SecurityError> for AppError {
+    fn from(err: indwell_security::SecurityError) -> Self {
+        Self::Security(err)
+    }
+}
+
+impl From<indwell_reflection::ReflectionError> for AppError {
+    fn from(err: indwell_reflection::ReflectionError) -> Self {
+        Self::Reflection(err)
+    }
+}
+
+impl From<serde_json::Error> for AppError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Json(err)
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        let message = match self {
+            Self::Channel(err) => err.to_string(),
+            Self::Memory(err) => err.to_string(),
+            Self::Provider(err) => err.to_string(),
+            Self::ProviderConfig(err) => err.to_string(),
+            Self::Ota(err) => err.to_string(),
+            Self::OtaCore(err) => err.to_string(),
+            Self::RunStore(err) => err.to_string(),
+            Self::Security(err) => err.to_string(),
+            Self::Reflection(err) => err.to_string(),
+            Self::Json(err) => err.to_string(),
+            Self::UnsupportedProviderKind(kind) => format!("unsupported provider kind: {kind}"),
+            Self::InvalidHex => "invalid hex input".to_string(),
+            Self::UnknownPairedDevice => "paired device not found".to_string(),
+        };
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiEnvelope::<()>::err(message)),
+        )
+            .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indwell_channel::{ChannelInbound, ChannelKind, ChannelPrincipal};
+    use indwell_protocol::{MobileCommand, ProviderConfig};
+
+    use super::{
+        api_key_env_name, auth_context_for_inbound, command_prompt, decode_hex_or_utf8,
+        provider_config_with_llm_fallback,
+    };
+
+    #[test]
+    fn api_key_ref_maps_to_stable_secret_env_name() {
+        assert_eq!(
+            api_key_env_name("key_llm-main"),
+            "INDWELL_SECRET_KEY_LLM_MAIN"
+        );
+    }
+
+    #[test]
+    fn mobile_command_maps_to_tool_planning_prompt() {
+        assert_eq!(
+            command_prompt(&MobileCommand::CaptureImage),
+            "capture camera image"
+        );
+        assert_eq!(
+            command_prompt(&MobileCommand::SystemStatus),
+            "system status"
+        );
+    }
+
+    #[test]
+    fn voice_provider_config_can_inherit_llm_connection_details() {
+        let llm = ProviderConfig {
+            kind: "openai_compatible".to_string(),
+            base_url: Some("https://api.example.com/v1".to_string()),
+            api_key_ref: Some("key_llm_main".to_string()),
+            model: "llm-model".to_string(),
+            max_input_tokens: Some(4000),
+            max_output_tokens: Some(600),
+        };
+        let asr = ProviderConfig {
+            kind: "same_as_llm".to_string(),
+            base_url: None,
+            api_key_ref: None,
+            model: "whisper-compatible".to_string(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+        };
+
+        let resolved = provider_config_with_llm_fallback(&asr, &llm);
+
+        assert_eq!(resolved.kind, "openai_compatible");
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        assert_eq!(resolved.api_key_ref.as_deref(), Some("key_llm_main"));
+        assert_eq!(resolved.model, "whisper-compatible");
+    }
+
+    #[test]
+    fn pairing_key_inputs_accept_hex_or_plain_text_for_host_sim() {
+        assert_eq!(decode_hex_or_utf8("01020a").unwrap(), vec![1, 2, 10]);
+        assert_eq!(
+            decode_hex_or_utf8("phone-public-key").unwrap(),
+            b"phone-public-key"
+        );
+    }
+
+    #[test]
+    fn subject_hint_no_longer_grants_owner_auth() {
+        let inbound = ChannelInbound {
+            channel: ChannelKind::LocalPwa,
+            session_id: "session-1".to_string(),
+            subject_hint: Some("owner".to_string()),
+            principal: None,
+            text: Some("delete memory".to_string()),
+            command: None,
+        };
+
+        let auth = auth_context_for_inbound(&inbound);
+
+        assert!(!auth.owner_authenticated);
+        assert!(auth.subject_id.is_none());
+    }
+
+    #[test]
+    fn verified_channel_principal_grants_owner_auth() {
+        let inbound = ChannelInbound {
+            channel: ChannelKind::LocalPwa,
+            session_id: "session-1".to_string(),
+            subject_hint: None,
+            principal: Some(ChannelPrincipal {
+                subject_id: "owner".to_string(),
+                owner_authenticated: true,
+            }),
+            text: Some("delete memory".to_string()),
+            command: None,
+        };
+
+        let auth = auth_context_for_inbound(&inbound);
+
+        assert!(auth.owner_authenticated);
+        assert_eq!(auth.subject_id.as_deref(), Some("owner"));
+    }
+}

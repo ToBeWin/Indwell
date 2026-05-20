@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#18231f">
+    <title>Indwell Console</title>
+    <link rel="manifest" href="./manifest.webmanifest">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Indwell OS Phase 0</p>
+          <h1>Console</h1>
+        </div>
+        <div class="connection-card" aria-live="polite">
+          <span id="statusDot" class="status-dot status-idle"></span>
+          <div>
+            <span class="meta-label">Host simulator</span>
+            <strong id="statusText">Not checked</strong>
+          </div>
+        </div>
+      </header>
+
+      <section class="panel config-panel" aria-labelledby="connection-title">
+        <div>
+          <h2 id="connection-title">Connection</h2>
+          <p>Static console pointed at the local host simulator.</p>
+        </div>
+        <form id="connectionForm" class="connection-form">
+          <label for="baseUrl">API base URL</label>
+          <div class="inline-control">
+            <input id="baseUrl" name="baseUrl" type="url" value="http://127.0.0.1:3030" autocomplete="url">
+            <button type="submit">Check</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="grid">
+        <article class="panel" aria-labelledby="provider-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="provider-title">Provider Config</h2>
+              <p>GET/PUT /v1/providers</p>
+            </div>
+            <button id="loadProviderButton" class="secondary" type="button">Load</button>
+          </div>
+          <form id="providerForm" class="stack">
+            <div class="two-column">
+              <label>
+                Kind
+                <input id="providerKind" name="providerKind" type="text" value="mock">
+              </label>
+              <label>
+                Model
+                <input id="providerModel" name="providerModel" type="text" value="mock:phase0">
+              </label>
+            </div>
+            <label for="providerBaseUrl">Base URL</label>
+            <input id="providerBaseUrl" name="providerBaseUrl" type="url" placeholder="https://api.example.com/v1">
+            <div class="two-column">
+              <label>
+                API key ref
+                <input id="providerApiKeyRef" name="providerApiKeyRef" type="text" placeholder="key_llm_main">
+              </label>
+              <label>
+                Max output tokens
+                <input id="providerMaxOutput" name="providerMaxOutput" type="number" min="1" max="8192" value="600">
+              </label>
+            </div>
+            <label for="providerApiKeySecret">Local API key secret</label>
+            <div class="inline-control">
+              <input id="providerApiKeySecret" name="providerApiKeySecret" type="password" placeholder="Stored in host-sim memory only" autocomplete="current-password">
+              <button id="saveSecretButton" class="secondary" type="button">Store secret</button>
+            </div>
+            <button type="submit">Save provider config</button>
+          </form>
+          <div id="providerResult" class="result-box empty">No provider config loaded yet.</div>
+        </article>
+
+        <article class="panel" aria-labelledby="provisioning-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="provisioning-title">Provisioning</h2>
+              <p>POST /v1/provisioning</p>
+            </div>
+            <button id="loadProvisioningButton" class="secondary" type="button">Load</button>
+          </div>
+          <form id="provisioningForm" class="stack">
+            <div class="two-column">
+              <label>
+                Device ID
+                <input id="provisioningDeviceId" name="provisioningDeviceId" type="text" value="indwell-proto-v1">
+              </label>
+              <label>
+                Wi-Fi SSID
+                <input id="provisioningSsid" name="provisioningSsid" type="text" placeholder="home-wifi">
+              </label>
+            </div>
+            <div class="two-column">
+              <label>
+                Wi-Fi password ref
+                <input id="provisioningPasswordRef" name="provisioningPasswordRef" type="text" placeholder="wifi_home">
+              </label>
+              <label>
+                Owner device label
+                <input id="provisioningOwnerLabel" name="provisioningOwnerLabel" type="text" value="Bingo phone">
+              </label>
+            </div>
+            <button type="submit">Apply provisioning</button>
+          </form>
+          <div id="provisioningResult" class="result-box empty">No provisioning request sent yet.</div>
+        </article>
+
+        <article class="panel" aria-labelledby="chat-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="chat-title">Channel Input</h2>
+              <p>POST /v1/channel/input</p>
+            </div>
+            <span class="chip">local_pwa</span>
+          </div>
+          <form id="channelForm" class="stack">
+            <label for="subjectHint">Subject hint</label>
+            <input id="subjectHint" name="subjectHint" type="text" value="owner" autocomplete="off">
+            <label for="channelText">Message</label>
+            <textarea id="channelText" name="channelText" rows="5" placeholder="Say something to the mock agent"></textarea>
+            <button type="submit">Send message</button>
+          </form>
+          <div id="channelResult" class="result-box empty">No channel input sent yet.</div>
+        </article>
+
+        <article class="panel" aria-labelledby="voice-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="voice-title">Voice Loop</h2>
+              <p>POST /v1/voice/mock-turn</p>
+            </div>
+            <span class="chip">mock ASR/TTS</span>
+          </div>
+          <form id="voiceForm" class="stack">
+            <label for="voiceText">Text hint</label>
+            <textarea id="voiceText" name="voiceText" rows="4" placeholder="Simulate a short captured voice turn"></textarea>
+            <button type="submit">Run voice turn</button>
+          </form>
+          <div id="voiceResult" class="result-box empty">No voice turn run yet.</div>
+        </article>
+
+        <article class="panel" aria-labelledby="memory-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="memory-title">Memory Search</h2>
+              <p>POST /v1/memory/search</p>
+            </div>
+            <div class="panel-actions">
+              <button id="refreshMemoryButton" class="secondary" type="button">Refresh</button>
+              <button id="exportMemoryButton" class="secondary" type="button">Export</button>
+              <button id="metabolizeMemoryButton" class="secondary" type="button">Metabolize</button>
+            </div>
+          </div>
+          <form id="memoryForm" class="stack">
+            <div class="two-column">
+              <label>
+                Wing
+                <input id="memoryWing" name="memoryWing" type="text" placeholder="user_unknown">
+              </label>
+              <label>
+                Room
+                <input id="memoryRoom" name="memoryRoom" type="text" placeholder="episodes">
+              </label>
+            </div>
+            <label for="memoryText">Text query</label>
+            <input id="memoryText" name="memoryText" type="search" placeholder="quiet morning">
+            <label for="memoryLimit">Limit</label>
+            <input id="memoryLimit" name="memoryLimit" type="number" min="1" max="100" value="10">
+            <button type="submit">Search memory</button>
+          </form>
+          <div id="memoryResult" class="memory-list empty">No memory search run yet.</div>
+          <div id="memoryExportResult" class="result-box empty">No memory export loaded yet.</div>
+        </article>
+
+        <article class="panel" aria-labelledby="reflection-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="reflection-title">Reflection</h2>
+              <p>POST /v1/reflection/run</p>
+            </div>
+          </div>
+          <form id="reflectionForm" class="stack">
+            <label for="reflectionLimit">Episode limit</label>
+            <input id="reflectionLimit" name="reflectionLimit" type="number" min="1" max="100" value="20">
+            <label class="inline-check">
+              <input id="reflectionSkills" name="reflectionSkills" type="checkbox" checked>
+              Generate skill templates
+            </label>
+            <button type="submit">Run reflection</button>
+          </form>
+          <div id="reflectionResult" class="result-box empty">No reflection run yet.</div>
+        </article>
+
+        <article class="panel" aria-labelledby="pairing-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="pairing-title">Pairing</h2>
+              <p>POST /v1/pairing/challenge and /complete</p>
+            </div>
+            <button id="listPairingButton" class="secondary" type="button">Devices</button>
+          </div>
+          <div class="button-row">
+            <button id="pairingChallengeButton" type="button">Issue challenge</button>
+          </div>
+          <form id="pairingForm" class="stack">
+            <div class="two-column">
+              <label>
+                Session ID
+                <input id="pairingSessionId" name="pairingSessionId" type="text" autocomplete="off">
+              </label>
+              <label>
+                Code
+                <input id="pairingCode" name="pairingCode" type="text" autocomplete="one-time-code">
+              </label>
+            </div>
+            <label for="pairingLabel">Device label</label>
+            <input id="pairingLabel" name="pairingLabel" type="text" value="Bingo phone">
+            <button type="submit">Complete pairing</button>
+          </form>
+          <div id="pairingResult" class="result-box empty">No pairing flow started yet.</div>
+        </article>
+
+        <article class="panel" aria-labelledby="passphrase-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="passphrase-title">Passphrase</h2>
+              <p>Dynamic confirmation challenge</p>
+            </div>
+          </div>
+          <div class="button-row">
+            <button id="passphraseChallengeButton" type="button">Issue phrase</button>
+          </div>
+          <form id="passphraseForm" class="stack">
+            <label for="passphraseChallengeId">Challenge ID</label>
+            <input id="passphraseChallengeId" name="passphraseChallengeId" type="text" autocomplete="off">
+            <label for="passphraseSpoken">Spoken phrase</label>
+            <input id="passphraseSpoken" name="passphraseSpoken" type="text" autocomplete="off">
+            <button type="submit">Verify phrase</button>
+          </form>
+          <div id="passphraseResult" class="result-box empty">No passphrase challenge started yet.</div>
+        </article>
+
+        <article class="panel tool-panel" aria-labelledby="tool-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="tool-title">Tool Runtime</h2>
+              <p>Policy check and POST /v1/tools/:tool/execute</p>
+            </div>
+            <button id="loadToolsButton" class="secondary" type="button">Catalog</button>
+          </div>
+          <div class="button-row">
+            <button id="toolCheckButton" type="button">Check camera</button>
+            <button id="toolStatusButton" class="secondary" type="button">Run status</button>
+            <button id="toolSensorButton" class="secondary" type="button">Read sensor</button>
+            <button id="toolCameraOwnerButton" class="secondary" type="button">Owner camera</button>
+            <button id="toolWriteMemoryButton" class="secondary" type="button">Write memory</button>
+            <button id="toolBlockedCameraButton" class="secondary" type="button">Try Telegram camera</button>
+          </div>
+          <div id="toolCatalogResult" class="memory-list empty">No tool catalog loaded yet.</div>
+          <div id="toolResult" class="result-box empty">No tool policy check run yet.</div>
+        </article>
+
+        <article class="panel" aria-labelledby="ota-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="ota-title">OTA Manifest</h2>
+              <p>GET /v1/ota/manifest and POST /v1/ota/check</p>
+            </div>
+          </div>
+          <div class="button-row">
+            <button id="loadOtaButton" type="button">Load manifest</button>
+            <button id="checkOtaButton" class="secondary" type="button">Verify manifest</button>
+            <button id="toolUpdateButton" class="secondary" type="button">Run update check</button>
+          </div>
+          <div id="otaResult" class="result-box empty">No OTA manifest loaded yet.</div>
+        </article>
+
+        <article class="panel" aria-labelledby="webhook-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="webhook-title">Custom Webhook</h2>
+              <p>POST /v1/gateway/custom-webhook</p>
+            </div>
+            <span class="chip">gateway</span>
+          </div>
+          <form id="webhookForm" class="stack">
+            <label for="webhookSource">Source</label>
+            <input id="webhookSource" name="webhookSource" type="text" value="local-test-gateway" autocomplete="off">
+            <label for="webhookText">Message</label>
+            <textarea id="webhookText" name="webhookText" rows="4" placeholder="Simulate a Telegram/Feishu/Dingtalk gateway message"></textarea>
+            <button type="submit">Send webhook</button>
+          </form>
+          <div id="webhookResult" class="result-box empty">No webhook input sent yet.</div>
+        </article>
+
+        <article class="panel" aria-labelledby="runs-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="runs-title">Run Audit</h2>
+              <p>GET /v1/runs and /v1/runs/:id</p>
+            </div>
+            <button id="refreshRunsButton" class="secondary" type="button">Refresh</button>
+          </div>
+          <div id="runsResult" class="memory-list empty">No run audit loaded yet.</div>
+          <div id="runDetailResult" class="result-box empty">No run detail loaded yet.</div>
+        </article>
+
+        <article class="panel log-panel" aria-labelledby="log-title">
+          <div class="panel-heading">
+            <div>
+              <h2 id="log-title">Raw API Log</h2>
+              <p>Recent requests and responses</p>
+            </div>
+            <button id="clearLogButton" class="secondary" type="button">Clear</button>
+          </div>
+          <pre id="apiLog" class="api-log" aria-live="polite"></pre>
+        </article>
+      </section>
+    </main>
+
+    <script src="./app.js" defer></script>
+  </body>
+</html>
