@@ -119,10 +119,12 @@ async function requestJson(path, options = {}) {
   const baseUrl = normalizeBaseUrl(els.baseUrl.value);
   const method = options.method || "GET";
   const requestBody = options.body;
+  const sessionToken = window.localStorage.getItem("indwell.console.sessionToken");
   const init = {
     method,
     headers: {
       Accept: "application/json",
+      ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
       ...(requestBody === undefined ? {} : { "Content-Type": "application/json" }),
     },
     body: requestBody === undefined ? undefined : JSON.stringify(requestBody),

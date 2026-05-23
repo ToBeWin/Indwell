@@ -7,8 +7,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -257,12 +258,25 @@ async fn main() -> anyhow::Result<()> {
         policy: Arc::new(PolicyEngine),
     };
 
-    let app = Router::new()
+    let public_routes = Router::new()
         .route("/health", get(health))
         .route("/v1/channel/input", post(channel_input))
         .route("/v1/voice/mock-turn", post(mock_voice_turn))
         .route("/v1/gateway/custom-webhook", post(custom_webhook_input))
         .route("/v1/channels/policies", get(channel_policies))
+        .route("/v1/pairing/challenge", post(issue_pairing_challenge))
+        .route("/v1/pairing/complete", post(complete_pairing))
+        .route("/v1/auth/session", post(issue_auth_session))
+        .route(
+            "/v1/auth/passphrase/challenge",
+            post(issue_passphrase_challenge),
+        )
+        .route(
+            "/v1/auth/passphrase/verify",
+            post(verify_passphrase_challenge),
+        );
+
+    let protected_routes = Router::new()
         .route("/v1/memory", post(create_memory))
         .route("/v1/memory/export", get(export_memory))
         .route("/v1/memory/metabolize", post(metabolize_memory))
@@ -277,19 +291,8 @@ async fn main() -> anyhow::Result<()> {
             "/v1/secrets/:key_ref",
             get(get_secret).put(put_secret).delete(delete_secret),
         )
-        .route("/v1/pairing/challenge", post(issue_pairing_challenge))
-        .route("/v1/pairing/complete", post(complete_pairing))
         .route("/v1/pairing/devices", get(list_paired_devices))
         .route("/v1/pairing/devices/:id", delete(revoke_paired_device))
-        .route("/v1/auth/session", post(issue_auth_session))
-        .route(
-            "/v1/auth/passphrase/challenge",
-            post(issue_passphrase_challenge),
-        )
-        .route(
-            "/v1/auth/passphrase/verify",
-            post(verify_passphrase_challenge),
-        )
         .route("/v1/ota/manifest", get(get_ota_manifest))
         .route("/v1/ota/check", post(check_ota_manifest))
         .route("/v1/ota/trust", get(get_ota_trust).put(save_ota_trust))
@@ -298,6 +301,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/tools", get(list_tools))
         .route("/v1/tools/:tool/check", post(check_tool))
         .route("/v1/tools/:tool/execute", post(execute_tool))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_session_auth,
+        ));
+
+    let app = public_routes
+        .merge(protected_routes)
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
@@ -318,6 +328,40 @@ async fn health() -> Json<ApiEnvelope<HealthResponse>> {
         service: "indwell-host-sim",
         status: "ok",
     }))
+}
+
+async fn require_session_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let token = session_token_from_headers(&headers).ok_or(AppError::MissingSessionToken)?;
+    let session = state
+        .sessions
+        .lock()
+        .await
+        .verify(&token, Utc::now().timestamp_millis() as u64)?;
+    request.extensions_mut().insert(session);
+    Ok(next.run(request).await)
+}
+
+fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            headers
+                .get("x-indwell-session-token")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
 }
 
 async fn channel_input(
@@ -1581,6 +1625,7 @@ enum AppError {
     UnsupportedProviderKind(String),
     InvalidHex,
     UnknownPairedDevice,
+    MissingSessionToken,
 }
 
 impl From<indwell_channel::ChannelError> for AppError {
@@ -1653,6 +1698,7 @@ impl IntoResponse for AppError {
             Self::UnsupportedProviderKind(kind) => format!("unsupported provider kind: {kind}"),
             Self::InvalidHex => "invalid hex input".to_string(),
             Self::UnknownPairedDevice => "paired device not found".to_string(),
+            Self::MissingSessionToken => "missing session token".to_string(),
         };
         (
             StatusCode::BAD_REQUEST,
@@ -1664,12 +1710,13 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::{header, HeaderMap, HeaderValue};
     use indwell_channel::{ChannelInbound, ChannelKind, ChannelPrincipal};
     use indwell_protocol::{MobileCommand, ProviderConfig};
 
     use super::{
         api_key_env_name, auth_context_for_inbound, command_prompt, decode_hex_or_utf8,
-        provider_config_with_llm_fallback,
+        provider_config_with_llm_fallback, session_token_from_headers,
     };
 
     #[test]
@@ -1766,5 +1813,28 @@ mod tests {
 
         assert!(auth.owner_authenticated);
         assert_eq!(auth.subject_id.as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn session_token_can_be_read_from_authorization_or_custom_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer session-token"),
+        );
+        assert_eq!(
+            session_token_from_headers(&headers).as_deref(),
+            Some("session-token")
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-indwell-session-token",
+            HeaderValue::from_static("session-token-2"),
+        );
+        assert_eq!(
+            session_token_from_headers(&headers).as_deref(),
+            Some("session-token-2")
+        );
     }
 }
