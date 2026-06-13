@@ -11,7 +11,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use chrono::Utc;
 use context::{apply_context_pack, ContextAssembler};
@@ -1132,6 +1132,7 @@ async fn list_tools() -> Json<ApiEnvelope<ToolCatalogResponse>> {
 
 async fn check_tool(
     State(state): State<AppState>,
+    Extension(session): Extension<AuthSession>,
     Path(tool): Path<String>,
     Json(channel): Json<ChannelKind>,
 ) -> Json<ApiEnvelope<ToolDecisionResponse>> {
@@ -1142,9 +1143,11 @@ async fn check_tool(
             ToolDescriptor::new(tool.clone(), "Unknown tool.", RiskLevel::Forbidden)
         });
     let policy = ChannelPolicy::default_for(channel);
-    let decision = state
-        .policy
-        .evaluate_tool(&descriptor, &AuthContext::anonymous(), &policy);
+    let auth = AuthContext::owner(
+        session.subject_id,
+        vec![indwell_core::AuthMethod::PairedDevice],
+    );
+    let decision = state.policy.evaluate_tool(&descriptor, &auth, &policy);
 
     Json(ApiEnvelope::ok(ToolDecisionResponse { tool, decision }))
 }
@@ -1719,11 +1722,15 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use axum::{
-        body::Body,
+        body::{to_bytes, Body},
         http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     };
+    use ed25519_dalek::{Signer, SigningKey};
     use indwell_channel::{ChannelInbound, ChannelKind, ChannelPrincipal};
     use indwell_protocol::{MobileCommand, ProviderConfig};
+    use indwell_security::{pairing_signature_payload, signed_request_payload, SignedRequest};
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
     use super::{
@@ -1783,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_key_inputs_accept_hex_or_plain_text_for_host_sim() {
+    fn pairing_key_inputs_accept_hex_or_utf8_for_host_sim() {
         assert_eq!(decode_hex_or_utf8("01020a").unwrap(), vec![1, 2, 10]);
         assert_eq!(
             decode_hex_or_utf8("phone-public-key").unwrap(),
@@ -1891,7 +1898,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn signed_pairing_can_issue_session_and_call_protected_route() {
+        let root = temp_root("signed-session");
+        let _ = std::fs::remove_dir_all(&root);
+        let app = build_router(init_state(root.clone()).unwrap());
+        let signing_key = SigningKey::from_bytes(&[42_u8; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        let challenge_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pairing/challenge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(challenge_response.status(), StatusCode::OK);
+        let challenge = response_data(challenge_response).await;
+        let session_id = challenge["session_id"].as_str().unwrap();
+        let code = challenge["code"].as_str().unwrap();
+        let label = "Test browser";
+        let pairing_signature = signing_key
+            .sign(pairing_signature_payload(session_id, code, label, &public_key).as_bytes())
+            .to_bytes();
+
+        let paired_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/pairing/complete")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_id": session_id,
+                            "code": code,
+                            "label": label,
+                            "public_key": hex_bytes(&public_key),
+                            "signature": hex_bytes(&pairing_signature),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paired_response.status(), StatusCode::OK);
+        let paired = response_data(paired_response).await;
+        let device_id = paired["device_id"].as_str().unwrap();
+
+        let signed = SignedRequest {
+            device_id: device_id.to_string(),
+            timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
+            nonce: "nonce-1".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/auth/session".to_string(),
+            body_sha256: hex_bytes(&Sha256::digest([])),
+        };
+        let request_signature = signing_key
+            .sign(signed_request_payload(&signed).as_bytes())
+            .to_bytes();
+
+        let session_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "device_id": signed.device_id,
+                            "subject_id": "owner",
+                            "timestamp_ms": signed.timestamp_ms,
+                            "nonce": signed.nonce,
+                            "method": signed.method,
+                            "path": signed.path,
+                            "body_sha256": signed.body_sha256,
+                            "signature": hex_bytes(&request_signature),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_response.status(), StatusCode::OK);
+        let session = response_data(session_response).await;
+        let token = session["token"].as_str().unwrap();
+
+        let providers_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/providers")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(providers_response.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn temp_root(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("indwell-host-sim-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn response_data(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()["data"].clone()
+    }
+
+    fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
+        bytes
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 }

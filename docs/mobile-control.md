@@ -23,3 +23,14 @@ The local PWA automatically attaches a stored `indwell.console.sessionToken`
 as a bearer token. A production mobile app should keep the paired-device
 private key in the OS keystore and sign session requests instead of storing
 long-lived raw credentials in application state.
+
+The host-sim console can create that token directly:
+
+1. Click `Issue challenge`.
+2. Click `Complete signed pairing`.
+3. Click `Issue session` if a token was not issued automatically.
+
+The browser signs both the pairing proof and the session request with an
+Ed25519 keypair. If the browser does not support WebCrypto Ed25519 in the
+current context, use a browser with Ed25519 support on `http://127.0.0.1` or
+`http://localhost`.

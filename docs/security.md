@@ -65,6 +65,29 @@ body_sha256=<lowercase hex sha256>
 
 The host simulator verifies that signature against the paired device public key before returning a session token.
 
+The static PWA implements this bootstrap locally:
+
+1. `POST /v1/pairing/challenge` returns a short pairing code.
+2. The browser generates or reuses an Ed25519 keypair.
+3. The browser signs:
+
+```text
+indwell-pairing-v1
+session_id=<session id>
+code=<PAIRING CODE>
+label=<device label>
+public_key_sha256=<sha256 raw public key>
+```
+
+4. `POST /v1/pairing/complete` stores the 32-byte public key.
+5. The browser signs an `indwell-request-v1` payload and calls
+   `POST /v1/auth/session`.
+6. The returned token is stored in localStorage and sent as a bearer token for
+   protected APIs.
+
+The private key stays in the browser. A production mobile app should store this
+key in the platform keystore.
+
 High-risk tool execution requires:
 
 1. a valid paired-device session token

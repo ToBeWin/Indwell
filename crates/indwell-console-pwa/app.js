@@ -1,5 +1,9 @@
 const DEFAULT_BASE_URL = "http://127.0.0.1:3030";
 const SESSION_ID = `pwa-${Date.now().toString(36)}`;
+const STORAGE_SESSION_TOKEN = "indwell.console.sessionToken";
+const STORAGE_PAIRED_DEVICE = "indwell.console.pairedDevice";
+const STORAGE_PUBLIC_KEY_JWK = "indwell.console.publicKeyJwk";
+const STORAGE_PRIVATE_KEY_JWK = "indwell.console.privateKeyJwk";
 
 const els = {
   baseUrl: document.querySelector("#baseUrl"),
@@ -45,12 +49,15 @@ const els = {
   reflectionSkills: document.querySelector("#reflectionSkills"),
   reflectionResult: document.querySelector("#reflectionResult"),
   pairingChallengeButton: document.querySelector("#pairingChallengeButton"),
+  issueSessionButton: document.querySelector("#issueSessionButton"),
+  clearSessionButton: document.querySelector("#clearSessionButton"),
   listPairingButton: document.querySelector("#listPairingButton"),
   pairingForm: document.querySelector("#pairingForm"),
   pairingSessionId: document.querySelector("#pairingSessionId"),
   pairingCode: document.querySelector("#pairingCode"),
   pairingLabel: document.querySelector("#pairingLabel"),
   pairingResult: document.querySelector("#pairingResult"),
+  sessionResult: document.querySelector("#sessionResult"),
   passphraseChallengeButton: document.querySelector("#passphraseChallengeButton"),
   passphraseForm: document.querySelector("#passphraseForm"),
   passphraseChallengeId: document.querySelector("#passphraseChallengeId"),
@@ -119,7 +126,7 @@ async function requestJson(path, options = {}) {
   const baseUrl = normalizeBaseUrl(els.baseUrl.value);
   const method = options.method || "GET";
   const requestBody = options.body;
-  const sessionToken = window.localStorage.getItem("indwell.console.sessionToken");
+  const sessionToken = window.localStorage.getItem(STORAGE_SESSION_TOKEN);
   const init = {
     method,
     headers: {
@@ -176,6 +183,146 @@ function formatTime(ms) {
 
 function formatJson(value) {
   return JSON.stringify(value, null, 2);
+}
+
+function utf8Bytes(value) {
+  return new TextEncoder().encode(value);
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function hexToBytes(value) {
+  const trimmed = value.trim();
+  const out = new Uint8Array(trimmed.length / 2);
+  for (let i = 0; i < out.length; i += 1) {
+    out[i] = Number.parseInt(trimmed.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+async function sha256Hex(value) {
+  const bytes = value instanceof Uint8Array ? value : utf8Bytes(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return bytesToHex(new Uint8Array(digest));
+}
+
+function randomHex(byteLength = 16) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return bytesToHex(bytes);
+}
+
+function pairingPayload(sessionId, code, label, publicKeyBytes, publicKeySha256) {
+  return [
+    "indwell-pairing-v1",
+    `session_id=${sessionId.trim()}`,
+    `code=${code.trim().toUpperCase()}`,
+    `label=${label.trim()}`,
+    `public_key_sha256=${publicKeySha256}`,
+    "",
+  ].join("\n");
+}
+
+function signedRequestPayload(request) {
+  return [
+    "indwell-request-v1",
+    `device_id=${request.device_id.trim()}`,
+    `timestamp_ms=${request.timestamp_ms}`,
+    `nonce=${request.nonce.trim()}`,
+    `method=${request.method.trim().toUpperCase()}`,
+    `path=${request.path.trim()}`,
+    `body_sha256=${request.body_sha256.trim().toLowerCase()}`,
+    "",
+  ].join("\n");
+}
+
+function loadJsonStorage(key) {
+  const value = window.localStorage.getItem(key);
+  return value ? JSON.parse(value) : null;
+}
+
+function saveJsonStorage(key, value) {
+  window.localStorage.setItem(key, JSON.stringify(value));
+}
+
+function hasSessionToken() {
+  return Boolean(window.localStorage.getItem(STORAGE_SESSION_TOKEN));
+}
+
+async function ensureConsoleKeyPair() {
+  if (!crypto?.subtle) {
+    throw new Error("WebCrypto is not available in this browser context.");
+  }
+
+  const publicJwk = loadJsonStorage(STORAGE_PUBLIC_KEY_JWK);
+  const privateJwk = loadJsonStorage(STORAGE_PRIVATE_KEY_JWK);
+  if (publicJwk && privateJwk) {
+    const publicKey = await crypto.subtle.importKey(
+      "jwk",
+      publicJwk,
+      { name: "Ed25519" },
+      true,
+      ["verify"],
+    );
+    const privateKey = await crypto.subtle.importKey(
+      "jwk",
+      privateJwk,
+      { name: "Ed25519" },
+      true,
+      ["sign"],
+    );
+    return { publicKey, privateKey };
+  }
+
+  const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+    "sign",
+    "verify",
+  ]);
+  saveJsonStorage(STORAGE_PUBLIC_KEY_JWK, await crypto.subtle.exportKey("jwk", pair.publicKey));
+  saveJsonStorage(STORAGE_PRIVATE_KEY_JWK, await crypto.subtle.exportKey("jwk", pair.privateKey));
+  return pair;
+}
+
+async function exportRawPublicKeyHex(publicKey) {
+  const raw = await crypto.subtle.exportKey("raw", publicKey);
+  return bytesToHex(new Uint8Array(raw));
+}
+
+async function signHex(privateKey, payload) {
+  const signature = await crypto.subtle.sign({ name: "Ed25519" }, privateKey, utf8Bytes(payload));
+  return bytesToHex(new Uint8Array(signature));
+}
+
+function renderSessionState() {
+  const paired = loadJsonStorage(STORAGE_PAIRED_DEVICE);
+  const token = window.localStorage.getItem(STORAGE_SESSION_TOKEN);
+
+  els.sessionResult.classList.remove("empty");
+  els.sessionResult.innerHTML = `
+    <dl class="kv">
+      <div><dt>Paired device</dt><dd>${escapeHtml(paired?.device_id || "none")}</dd></div>
+      <div><dt>Session token</dt><dd>${escapeHtml(token ? "present" : "missing")}</dd></div>
+      <div><dt>Subject</dt><dd>${escapeHtml(paired?.subject_id || "owner")}</dd></div>
+    </dl>
+  `;
+}
+
+function renderProtectedApiHint(target, label) {
+  target.classList.remove("empty");
+  target.innerHTML = `<strong>Session required</strong><p>Complete signed pairing and issue a session before loading ${escapeHtml(label)}.</p>`;
+}
+
+function requireSessionFor(target, label) {
+  if (hasSessionToken()) {
+    return true;
+  }
+  renderProtectedApiHint(target, label);
+  renderSessionState();
+  return false;
 }
 
 function collectMemoryQuery() {
@@ -237,6 +384,9 @@ function renderProviderConfig(config) {
 }
 
 async function loadProviderConfig() {
+  if (!requireSessionFor(els.providerResult, "provider config")) {
+    return;
+  }
   setBusy(els.loadProviderButton, true);
 
   try {
@@ -251,6 +401,9 @@ async function loadProviderConfig() {
 
 async function saveProviderConfig(event) {
   event.preventDefault();
+  if (!requireSessionFor(els.providerResult, "provider config")) {
+    return;
+  }
   const button = event.submitter;
   setBusy(button, true);
 
@@ -288,6 +441,9 @@ function collectProviderConfig() {
 }
 
 async function saveProviderSecret() {
+  if (!requireSessionFor(els.providerResult, "provider secrets")) {
+    return;
+  }
   setBusy(els.saveSecretButton, true);
   const keyRef = els.providerApiKeyRef.value.trim() || "key_llm_main";
 
@@ -316,6 +472,9 @@ async function saveProviderSecret() {
 
 async function saveProvisioning(event) {
   event.preventDefault();
+  if (!requireSessionFor(els.provisioningResult, "provisioning")) {
+    return;
+  }
   const button = event.submitter;
   setBusy(button, true);
 
@@ -348,6 +507,9 @@ async function saveProvisioning(event) {
 }
 
 async function loadProvisioning() {
+  if (!requireSessionFor(els.provisioningResult, "provisioning")) {
+    return;
+  }
   setBusy(els.loadProvisioningButton, true);
 
   try {
@@ -425,6 +587,9 @@ async function runVoiceTurn(event) {
 }
 
 async function runMemorySearch(query, button) {
+  if (!requireSessionFor(els.memoryResult, "memory")) {
+    return;
+  }
   setBusy(button, true);
 
   try {
@@ -474,6 +639,9 @@ async function refreshMemorySearch() {
 }
 
 async function exportMemory() {
+  if (!requireSessionFor(els.memoryExportResult, "memory export")) {
+    return;
+  }
   setBusy(els.exportMemoryButton, true);
 
   try {
@@ -499,6 +667,9 @@ async function exportMemory() {
 }
 
 async function metabolizeMemory() {
+  if (!requireSessionFor(els.memoryExportResult, "memory metabolism")) {
+    return;
+  }
   setBusy(els.metabolizeMemoryButton, true);
 
   try {
@@ -522,6 +693,9 @@ async function metabolizeMemory() {
 
 async function runReflection(event) {
   event.preventDefault();
+  if (!requireSessionFor(els.reflectionResult, "reflection")) {
+    return;
+  }
   const button = event.submitter;
   setBusy(button, true);
 
@@ -579,15 +753,30 @@ async function completePairing(event) {
   setBusy(button, true);
 
   try {
+    const keyPair = await ensureConsoleKeyPair();
+    const publicKeyHex = await exportRawPublicKeyHex(keyPair.publicKey);
+    const publicKeyBytes = hexToBytes(publicKeyHex);
+    const label = els.pairingLabel.value.trim() || "Paired phone";
+    const publicKeySha256 = await sha256Hex(publicKeyBytes);
+    const payload = pairingPayload(
+      els.pairingSessionId.value,
+      els.pairingCode.value,
+      label,
+      publicKeyBytes,
+      publicKeySha256,
+    );
+    const signature = await signHex(keyPair.privateKey, payload);
     const paired = await requestJson("/v1/pairing/complete", {
       method: "POST",
       body: {
         session_id: els.pairingSessionId.value.trim(),
         code: els.pairingCode.value.trim(),
-        label: els.pairingLabel.value.trim() || "Paired phone",
-        public_key: `pwa-public-key-${SESSION_ID}`,
+        label,
+        public_key: publicKeyHex,
+        signature,
       },
     });
+    saveJsonStorage(STORAGE_PAIRED_DEVICE, { ...paired, subject_id: "owner" });
     els.pairingResult.classList.remove("empty");
     els.pairingResult.innerHTML = `
       <dl class="kv">
@@ -596,6 +785,7 @@ async function completePairing(event) {
         <div><dt>Key hash</dt><dd>${escapeHtml(paired.public_key_hash)}</dd></div>
       </dl>
     `;
+    await issueAuthSession();
   } catch (error) {
     renderError(els.pairingResult, error);
   } finally {
@@ -603,7 +793,65 @@ async function completePairing(event) {
   }
 }
 
+async function issueAuthSession(button = els.issueSessionButton) {
+  setBusy(button, true);
+
+  try {
+    const paired = loadJsonStorage(STORAGE_PAIRED_DEVICE);
+    if (!paired?.device_id) {
+      throw new Error("Complete pairing before issuing a session.");
+    }
+    const keyPair = await ensureConsoleKeyPair();
+    const request = {
+      device_id: paired.device_id,
+      subject_id: paired.subject_id || "owner",
+      timestamp_ms: Date.now(),
+      nonce: randomHex(16),
+      method: "POST",
+      path: "/v1/auth/session",
+      body_sha256: await sha256Hex(""),
+    };
+    const signature = await signHex(keyPair.privateKey, signedRequestPayload(request));
+    const response = await requestJson("/v1/auth/session", {
+      method: "POST",
+      body: {
+        ...request,
+        signature,
+      },
+    });
+
+    window.localStorage.setItem(STORAGE_SESSION_TOKEN, response.token);
+    saveJsonStorage(STORAGE_PAIRED_DEVICE, {
+      ...paired,
+      subject_id: response.session.subject_id,
+      session_expires_at_ms: response.session.expires_at_ms,
+    });
+    els.sessionResult.classList.remove("empty");
+    els.sessionResult.innerHTML = `
+      <strong>Session issued</strong>
+      <dl class="kv">
+        <div><dt>Device</dt><dd>${escapeHtml(response.session.device_id)}</dd></div>
+        <div><dt>Subject</dt><dd>${escapeHtml(response.session.subject_id)}</dd></div>
+        <div><dt>Expires</dt><dd>${escapeHtml(formatTime(response.session.expires_at_ms))}</dd></div>
+      </dl>
+    `;
+    await loadProtectedDashboard();
+  } catch (error) {
+    renderError(els.sessionResult, error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function clearConsoleSession() {
+  window.localStorage.removeItem(STORAGE_SESSION_TOKEN);
+  renderSessionState();
+}
+
 async function listPairedDevices() {
+  if (!requireSessionFor(els.pairingResult, "paired devices")) {
+    return;
+  }
   setBusy(els.listPairingButton, true);
 
   try {
@@ -674,6 +922,9 @@ async function verifyPassphraseChallenge(event) {
 }
 
 async function checkCameraTool() {
+  if (!requireSessionFor(els.toolResult, "tool policy checks")) {
+    return;
+  }
   setBusy(els.toolCheckButton, true);
 
   try {
@@ -699,6 +950,9 @@ async function checkCameraTool() {
 }
 
 async function loadToolCatalog() {
+  if (!requireSessionFor(els.toolCatalogResult, "tool catalog")) {
+    return;
+  }
   setBusy(els.loadToolsButton, true);
 
   try {
@@ -742,10 +996,13 @@ function renderToolExecution(data) {
 }
 
 async function executeTool(tool, channel, input, button) {
+  if (!requireSessionFor(els.toolResult, "tool execution")) {
+    return;
+  }
   setBusy(button, true);
 
   try {
-    const sessionToken = window.localStorage.getItem("indwell.console.sessionToken");
+    const sessionToken = window.localStorage.getItem(STORAGE_SESSION_TOKEN);
     const data = await requestJson(`/v1/tools/${encodeURIComponent(tool)}/execute`, {
       method: "POST",
       body: {
@@ -809,6 +1066,9 @@ async function executeBlockedCameraTool() {
 }
 
 async function loadOtaManifest() {
+  if (!requireSessionFor(els.otaResult, "OTA manifest")) {
+    return;
+  }
   setBusy(els.loadOtaButton, true);
 
   try {
@@ -831,6 +1091,9 @@ async function loadOtaManifest() {
 }
 
 async function checkOtaManifest() {
+  if (!requireSessionFor(els.otaResult, "OTA verification")) {
+    return;
+  }
   setBusy(els.checkOtaButton, true);
 
   try {
@@ -896,6 +1159,9 @@ async function sendWebhookInput(event) {
 }
 
 async function refreshRuns() {
+  if (!requireSessionFor(els.runsResult, "run audit")) {
+    return;
+  }
   setBusy(els.refreshRunsButton, true);
 
   try {
@@ -969,6 +1235,23 @@ function registerServiceWorker() {
   });
 }
 
+async function loadProtectedDashboard() {
+  if (!hasSessionToken()) {
+    renderProtectedApiHint(els.providerResult, "provider config");
+    renderProtectedApiHint(els.toolCatalogResult, "tool catalog");
+    renderProtectedApiHint(els.otaResult, "OTA manifest");
+    renderProtectedApiHint(els.runsResult, "run audit");
+    return;
+  }
+
+  await Promise.allSettled([
+    loadProviderConfig(),
+    loadToolCatalog(),
+    loadOtaManifest(),
+    refreshRuns(),
+  ]);
+}
+
 setBaseUrl(loadBaseUrl());
 els.connectionForm.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -989,6 +1272,8 @@ els.metabolizeMemoryButton.addEventListener("click", metabolizeMemory);
 els.reflectionForm.addEventListener("submit", runReflection);
 els.pairingChallengeButton.addEventListener("click", issuePairingChallenge);
 els.pairingForm.addEventListener("submit", completePairing);
+els.issueSessionButton.addEventListener("click", () => issueAuthSession());
+els.clearSessionButton.addEventListener("click", clearConsoleSession);
 els.listPairingButton.addEventListener("click", listPairedDevices);
 els.passphraseChallengeButton.addEventListener("click", issuePassphraseChallenge);
 els.passphraseForm.addEventListener("submit", verifyPassphraseChallenge);
@@ -1017,7 +1302,5 @@ els.clearLogButton.addEventListener("click", () => {
 });
 registerServiceWorker();
 checkHealth();
-loadProviderConfig();
-loadToolCatalog();
-loadOtaManifest();
-refreshRuns();
+renderSessionState();
+loadProtectedDashboard();

@@ -204,12 +204,14 @@
           <div class="panel-heading">
             <div>
               <h2 id="pairing-title">Pairing</h2>
-              <p>POST /v1/pairing/challenge and /complete</p>
+              <p>Signed local console pairing and session</p>
             </div>
             <button id="listPairingButton" class="secondary" type="button">Devices</button>
           </div>
           <div class="button-row">
             <button id="pairingChallengeButton" type="button">Issue challenge</button>
+            <button id="issueSessionButton" class="secondary" type="button">Issue session</button>
+            <button id="clearSessionButton" class="secondary" type="button">Clear session</button>
           </div>
           <form id="pairingForm" class="stack">
             <div class="two-column">
@@ -224,9 +226,10 @@
             </div>
             <label for="pairingLabel">Device label</label>
             <input id="pairingLabel" name="pairingLabel" type="text" value="Bingo phone">
-            <button type="submit">Complete pairing</button>
+            <button type="submit">Complete signed pairing</button>
           </form>
           <div id="pairingResult" class="result-box empty">No pairing flow started yet.</div>
+          <div id="sessionResult" class="result-box empty">No console session issued yet.</div>
         </article>
 
         <article class="panel" aria-labelledby="passphrase-title">

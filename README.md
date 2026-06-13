@@ -21,6 +21,18 @@ The implementation follows the engineering specification in `AGENTS.md`.
 
 ## Run Locally
 
+Run the non-hardware verification gate:
+
+```sh
+make verify-nonhardware
+```
+
+Run a host simulator HTTP smoke test:
+
+```sh
+make smoke-host-sim
+```
+
 Start the host simulator:
 
 ```sh
@@ -45,6 +57,30 @@ The simulator API listens on:
 http://127.0.0.1:3030
 ```
 
+In the PWA, use `Pairing` in this order:
+
+1. `Issue challenge`
+2. `Complete signed pairing`
+3. `Issue session`
+
+The console generates an Ed25519 keypair in the browser, signs the pairing
+payload, exchanges a signed request for a local session token, and stores that
+token in localStorage for protected management APIs.
+
+Minimal public API smoke path:
+
+```sh
+curl -fsS http://127.0.0.1:3030/health
+
+curl -fsS -X POST http://127.0.0.1:3030/v1/channel/input \
+  -H 'content-type: application/json' \
+  -d '{"channel":"local_pwa","session_id":"demo","subject_hint":"owner","text":"remember I like quiet mornings"}'
+
+curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
+  -H 'content-type: application/json' \
+  -d '{"text_hint":"hello indwell","voice":"warm_indwell"}'
+```
+
 ## Current Phase 0 Surface
 
 - Local memory: append/search/delete/compact/export over JSONL drawers.
@@ -56,7 +92,7 @@ http://127.0.0.1:3030
 - Provider config: local JSON config with API key references, rejecting raw API keys in config.
 - Provider runtime: mock by default, plus OpenAI-compatible HTTP chat, vision, ASR, TTS, and embedding paths for host/desktop.
 - Local secrets: host simulator seals local API secrets for an API key ref without returning the raw value.
-- Session auth: protected host-sim routes require a signed paired-device session token.
+- Session auth: protected host-sim routes require a signed paired-device session token; the PWA can generate a browser Ed25519 keypair, complete signed pairing, and issue a session.
 - Confirmation grants: high-risk tools require a valid session plus a scoped, single-use passphrase grant.
 - Tool runtime: status, LED, speaker, camera capture mock, sensor read mock, memory search/write/delete, identity, confirmation, OTA check.
 - OTA: local manifest store, shape checks, HTTPS URL check, SHA-256 format check, Ed25519 manifest signature verification, apply plan, slot alternation.
@@ -96,6 +132,8 @@ need a passphrase-derived confirmation grant bound to the exact tool name.
 ## Verification
 
 ```sh
+make verify-nonhardware
+make smoke-host-sim
 cargo fmt --all --check
 cargo test
 node --check crates/indwell-console-pwa/app.js

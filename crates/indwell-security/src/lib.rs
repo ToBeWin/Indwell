@@ -421,6 +421,9 @@ impl PairingManager {
         public_key: &[u8],
         now_ms: u64,
     ) -> Result<PairedDevice, SecurityError> {
+        if public_key.len() != 32 {
+            return Err(SecurityError::InvalidPairingPublicKey);
+        }
         let challenge = self
             .challenges
             .remove(session_id)
@@ -869,21 +872,40 @@ mod tests {
     fn pairing_challenge_creates_paired_device() {
         let mut manager = PairingManager::default();
         let challenge = manager.issue_challenge(1000, 30_000);
+        let public_key = [7_u8; 32];
 
         let paired = manager
             .complete_pairing(
                 &challenge.session_id,
                 &challenge.code,
                 "Bingo phone",
-                b"phone-public-key",
+                &public_key,
                 2000,
             )
             .unwrap();
 
         assert_eq!(paired.label, "Bingo phone");
-        assert_eq!(paired.public_key, b"phone-public-key");
+        assert_eq!(paired.public_key, public_key);
         assert!(paired.revoked_at_ms.is_none());
         assert_eq!(manager.paired_devices().len(), 1);
+    }
+
+    #[test]
+    fn pairing_rejects_invalid_public_key() {
+        let mut manager = PairingManager::default();
+        let challenge = manager.issue_challenge(1000, 30_000);
+
+        let error = manager
+            .complete_pairing(
+                &challenge.session_id,
+                &challenge.code,
+                "Bingo phone",
+                b"not-an-ed25519-public-key",
+                2000,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, SecurityError::InvalidPairingPublicKey));
     }
 
     #[test]
@@ -973,13 +995,14 @@ mod tests {
     fn pairing_rejects_wrong_code() {
         let mut manager = PairingManager::default();
         let challenge = manager.issue_challenge(1000, 30_000);
+        let public_key = [7_u8; 32];
 
         let error = manager
             .complete_pairing(
                 &challenge.session_id,
                 "WRONG",
                 "Bingo phone",
-                b"phone-public-key",
+                &public_key,
                 2000,
             )
             .unwrap_err();
@@ -1069,12 +1092,13 @@ mod tests {
         let store = JsonPairedDeviceStore::new(root.join("pairing/devices.json")).unwrap();
         let mut manager = PairingManager::default();
         let challenge = manager.issue_challenge(1000, 30_000);
+        let public_key = [8_u8; 32];
         let paired = manager
             .complete_pairing(
                 &challenge.session_id,
                 &challenge.code,
                 "Bingo phone",
-                b"phone-public-key",
+                &public_key,
                 2000,
             )
             .unwrap();
