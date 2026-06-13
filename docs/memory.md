@@ -7,6 +7,8 @@ Implemented:
 - `MemoryRecord` schema with kind, wing, room, source, confidence, importance, sensitivity, TTL, tags, and hash.
 - Tombstone deletes.
 - Search by wing, room, and text.
+- PWA add/search/delete/export/JSON inspection controls.
+- Delete requests through the tool runtime for AgentRun audit coverage.
 - Compacting active records into `compacted.jsonl`.
 - Export with generated snapshots:
   - persona identity/preference/emotional/safety entries
@@ -21,7 +23,7 @@ Implemented:
 Next layers:
 
 - Reflection-generated candidate memories.
-- User-visible audit reasons.
+- Richer user-visible audit reasons.
 - Retention budgets for verbatim audio/image references.
 - Decay and consolidation schedules.
 - Optional vector index for host / phone / stronger hardware.

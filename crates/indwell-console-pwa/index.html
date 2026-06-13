@@ -177,6 +177,30 @@
             <input id="memoryLimit" name="memoryLimit" type="number" min="1" max="100" value="10">
             <button type="submit">Search memory</button>
           </form>
+          <form id="addMemoryForm" class="stack memory-add-form">
+            <div class="two-column">
+              <label>
+                Kind
+                <select id="addMemoryKind" name="addMemoryKind">
+                  <option value="preference">Preference</option>
+                  <option value="episodic">Episodic</option>
+                  <option value="identity">Identity</option>
+                  <option value="relationship">Relationship</option>
+                  <option value="environment">Environment</option>
+                  <option value="safety">Safety</option>
+                </select>
+              </label>
+              <label>
+                Wing
+                <input id="addMemoryWing" name="addMemoryWing" type="text" value="user_unknown">
+              </label>
+            </div>
+            <label for="addMemoryRoom">Room</label>
+            <input id="addMemoryRoom" name="addMemoryRoom" type="text" value="preferences">
+            <label for="addMemoryContent">Content</label>
+            <textarea id="addMemoryContent" name="addMemoryContent" rows="3" placeholder="Add a reviewed memory"></textarea>
+            <button type="submit">Add memory</button>
+          </form>
           <div id="memoryResult" class="memory-list empty">No memory search run yet.</div>
           <div id="memoryExportResult" class="result-box empty">No memory export loaded yet.</div>
         </article>

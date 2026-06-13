@@ -83,7 +83,7 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 
 ## Current Phase 0 Surface
 
-- Local memory: append/search/delete/compact/export over JSONL drawers.
+- Local memory: append/search/delete/compact/export over JSONL drawers, with PWA add/delete/JSON inspection controls.
 - Memory metabolism: TTL expiry, decay, and preference consolidation into reflection records.
 - Reflection Engine: derives preference, relationship, emotional, and skill memories from episodic records with source tags.
 - Channel gateway: local PWA, LAN/BLE/USB style channels, chat app style channels, MQTT/Home Assistant/custom webhook normalization.
@@ -97,7 +97,7 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 - Confirmation grants: high-risk tools require a valid session plus a scoped, single-use passphrase grant.
 - Tool runtime: provider-returned structured tool calls, planner fallback, status, LED, speaker, camera capture mock, sensor read mock, memory search/write/delete, identity, confirmation, OTA check.
 - OTA: local manifest store, shape checks, HTTPS URL check, SHA-256 format check, Ed25519 manifest signature verification, apply plan, slot alternation.
-- Console PWA: provider config, channel input, custom webhook, memory search/export, tool catalog/runtime, OTA manifest/check, run audit, raw API log.
+- Console PWA: provider config, channel input, custom webhook, memory add/search/delete/export/JSON inspection, tool catalog/runtime, OTA manifest/check, run audit, raw API log.
 - Firmware scaffold: ESP32-S3 boot plan, HAL boundary, partition table, and sdkconfig defaults.
 - ESP-IDF driver map: Proto v1 peripheral bindings to HAL traits.
 - Protocol provisioning schema: Wi-Fi password references and provider config without raw secrets.

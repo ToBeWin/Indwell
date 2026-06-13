@@ -39,6 +39,11 @@ const els = {
   memoryRoom: document.querySelector("#memoryRoom"),
   memoryText: document.querySelector("#memoryText"),
   memoryLimit: document.querySelector("#memoryLimit"),
+  addMemoryForm: document.querySelector("#addMemoryForm"),
+  addMemoryKind: document.querySelector("#addMemoryKind"),
+  addMemoryWing: document.querySelector("#addMemoryWing"),
+  addMemoryRoom: document.querySelector("#addMemoryRoom"),
+  addMemoryContent: document.querySelector("#addMemoryContent"),
   memoryResult: document.querySelector("#memoryResult"),
   memoryExportResult: document.querySelector("#memoryExportResult"),
   refreshMemoryButton: document.querySelector("#refreshMemoryButton"),
@@ -334,6 +339,48 @@ function collectMemoryQuery() {
   };
 }
 
+function collectNewMemory() {
+  return {
+    kind: els.addMemoryKind.value,
+    wing: els.addMemoryWing.value.trim() || "user_unknown",
+    room: els.addMemoryRoom.value.trim() || "preferences",
+    content: els.addMemoryContent.value.trim(),
+  };
+}
+
+function renderMemoryCard(record) {
+  const encoded = encodeURIComponent(JSON.stringify(record));
+  return `
+    <section class="memory-card" data-memory-id="${escapeHtml(record.id)}">
+      <header>
+        <span>${escapeHtml(record.kind)}</span>
+        <span>${escapeHtml(record.wing)} / ${escapeHtml(record.room)}</span>
+        <span>${escapeHtml(formatTime(record.created_at_ms))}</span>
+      </header>
+      <p>${escapeHtml(record.content)}</p>
+      <p class="subtle">ID: ${escapeHtml(record.id)} · source: ${escapeHtml(formatMemorySource(record.source))} · confidence: ${escapeHtml(record.confidence ?? "n/a")}</p>
+      <div class="memory-card-actions">
+        <button class="secondary compact" type="button" data-memory-copy-id="${escapeHtml(record.id)}">Copy ID</button>
+        <button class="secondary compact" type="button" data-memory-json="${encoded}">Show JSON</button>
+        <button class="secondary compact danger" type="button" data-memory-delete-id="${escapeHtml(record.id)}">Delete</button>
+      </div>
+    </section>
+  `;
+}
+
+function formatMemorySource(source) {
+  if (!source) {
+    return "unknown";
+  }
+  if (typeof source === "string") {
+    return source;
+  }
+  if (source.agent_run?.run_id) {
+    return `agent_run:${source.agent_run.run_id}`;
+  }
+  return JSON.stringify(source);
+}
+
 function describePolicyDecision(decision) {
   if (typeof decision === "string") {
     return {
@@ -604,20 +651,7 @@ async function runMemorySearch(query, button) {
       return;
     }
 
-    els.memoryResult.innerHTML = records
-      .map(
-        (record) => `
-          <section class="memory-card">
-            <header>
-              <span>${escapeHtml(record.kind)}</span>
-              <span>${escapeHtml(record.wing)} / ${escapeHtml(record.room)}</span>
-              <span>${escapeHtml(formatTime(record.created_at_ms))}</span>
-            </header>
-            <p>${escapeHtml(record.content)}</p>
-          </section>
-        `,
-      )
-      .join("");
+    els.memoryResult.innerHTML = records.map(renderMemoryCard).join("");
   } catch (error) {
     renderError(els.memoryResult, error);
   } finally {
@@ -636,6 +670,96 @@ async function refreshMemorySearch() {
   const query = lastMemoryQuery || collectMemoryQuery();
   lastMemoryQuery = query;
   await runMemorySearch(query, els.refreshMemoryButton);
+}
+
+async function addMemory(event) {
+  event.preventDefault();
+  if (!requireSessionFor(els.memoryResult, "memory")) {
+    return;
+  }
+  const button = event.submitter;
+  setBusy(button, true);
+
+  try {
+    const memory = collectNewMemory();
+    if (!memory.content) {
+      throw new Error("Memory content is required.");
+    }
+    const record = await requestJson("/v1/memory", {
+      method: "POST",
+      body: memory,
+    });
+    els.addMemoryContent.value = "";
+    els.memoryExportResult.classList.remove("empty");
+    els.memoryExportResult.innerHTML = `
+      <strong>Memory added</strong>
+      <dl class="kv">
+        <div><dt>ID</dt><dd>${escapeHtml(record.id)}</dd></div>
+        <div><dt>Room</dt><dd>${escapeHtml(record.wing)} / ${escapeHtml(record.room)}</dd></div>
+      </dl>
+      <pre class="json-preview">${escapeHtml(formatJson(record))}</pre>
+    `;
+    await refreshMemorySearch();
+  } catch (error) {
+    renderError(els.memoryExportResult, error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function deleteMemory(memoryId, button) {
+  if (!requireSessionFor(els.memoryResult, "memory deletion")) {
+    return;
+  }
+  setBusy(button, true);
+
+  try {
+    const data = await executeTool(
+      "memory.delete",
+      "local_pwa",
+      { id: memoryId },
+      button,
+      { render: false },
+    );
+    els.memoryExportResult.classList.remove("empty");
+    els.memoryExportResult.innerHTML = `
+      <strong>Memory delete requested</strong>
+      <dl class="kv">
+        <div><dt>ID</dt><dd>${escapeHtml(memoryId)}</dd></div>
+        <div><dt>Run ID</dt><dd>${escapeHtml(data.run_id || "none")}</dd></div>
+        <div><dt>Decision</dt><dd>${escapeHtml(describePolicyDecision(data.decision).decision)}</dd></div>
+      </dl>
+      <pre class="json-preview">${escapeHtml(formatJson(data.output || data))}</pre>
+    `;
+    await refreshMemorySearch();
+    refreshRuns();
+  } catch (error) {
+    renderError(els.memoryExportResult, error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function copyMemoryId(memoryId, button) {
+  try {
+    await navigator.clipboard.writeText(memoryId);
+    button.dataset.originalText ||= button.textContent;
+    button.textContent = "Copied";
+    window.setTimeout(() => {
+      button.textContent = button.dataset.originalText;
+    }, 1100);
+  } catch (error) {
+    renderError(els.memoryExportResult, error);
+  }
+}
+
+function showMemoryJson(encodedRecord) {
+  const record = JSON.parse(decodeURIComponent(encodedRecord));
+  els.memoryExportResult.classList.remove("empty");
+  els.memoryExportResult.innerHTML = `
+    <strong>Memory JSON</strong>
+    <pre class="json-preview">${escapeHtml(formatJson(record))}</pre>
+  `;
 }
 
 async function exportMemory() {
@@ -995,7 +1119,7 @@ function renderToolExecution(data) {
   `;
 }
 
-async function executeTool(tool, channel, input, button) {
+async function executeTool(tool, channel, input, button, options = {}) {
   if (!requireSessionFor(els.toolResult, "tool execution")) {
     return;
   }
@@ -1017,10 +1141,14 @@ async function executeTool(tool, channel, input, button) {
       },
     });
 
-    renderToolExecution(data);
-    refreshRuns();
+    if (options.render !== false) {
+      renderToolExecution(data);
+      refreshRuns();
+    }
+    return data;
   } catch (error) {
     renderError(els.toolResult, error);
+    throw error;
   } finally {
     setBusy(button, false);
   }
@@ -1266,9 +1394,28 @@ els.loadProvisioningButton.addEventListener("click", loadProvisioning);
 els.channelForm.addEventListener("submit", sendChannelInput);
 els.voiceForm.addEventListener("submit", runVoiceTurn);
 els.memoryForm.addEventListener("submit", searchMemory);
+els.addMemoryForm.addEventListener("submit", addMemory);
 els.refreshMemoryButton.addEventListener("click", refreshMemorySearch);
 els.exportMemoryButton.addEventListener("click", exportMemory);
 els.metabolizeMemoryButton.addEventListener("click", metabolizeMemory);
+els.memoryResult.addEventListener("click", (event) => {
+  const copyButton = event.target.closest("[data-memory-copy-id]");
+  if (copyButton) {
+    copyMemoryId(copyButton.dataset.memoryCopyId, copyButton);
+    return;
+  }
+
+  const jsonButton = event.target.closest("[data-memory-json]");
+  if (jsonButton) {
+    showMemoryJson(jsonButton.dataset.memoryJson);
+    return;
+  }
+
+  const deleteButton = event.target.closest("[data-memory-delete-id]");
+  if (deleteButton) {
+    deleteMemory(deleteButton.dataset.memoryDeleteId, deleteButton);
+  }
+});
 els.reflectionForm.addEventListener("submit", runReflection);
 els.pairingChallengeButton.addEventListener("click", issuePairingChallenge);
 els.pairingForm.addEventListener("submit", completePairing);

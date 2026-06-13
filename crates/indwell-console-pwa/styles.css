@@ -29,7 +29,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -62,6 +63,15 @@ button.secondary:hover {
   background: #e2ebe5;
 }
 
+button.danger {
+  background: #f4e6e2;
+  color: var(--danger);
+}
+
+button.danger:hover {
+  background: #efd7d1;
+}
+
 button.compact {
   min-height: 34px;
   margin-top: 12px;
@@ -70,7 +80,8 @@ button.compact {
 }
 
 input,
-textarea {
+textarea,
+select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -85,7 +96,8 @@ textarea {
 }
 
 input:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(31, 122, 85, 0.15);
 }
@@ -318,6 +330,12 @@ p {
   gap: 10px;
 }
 
+.memory-add-form {
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
 .memory-card {
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -344,6 +362,13 @@ p {
   margin-top: 8px;
   color: var(--muted);
   font-size: 0.82rem;
+}
+
+.memory-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 .tool-panel {

@@ -1867,7 +1867,7 @@ mod tests {
     };
     use ed25519_dalek::{Signer, SigningKey};
     use indwell_channel::{ChannelInbound, ChannelKind, ChannelPrincipal};
-    use indwell_memory::{MemoryQuery, MemoryStore};
+    use indwell_memory::{MemoryQuery, MemoryRecord, MemoryStore};
     use indwell_protocol::{MobileCommand, ProviderConfig, ProviderConfigSet};
     use indwell_runs::RunStore;
     use indwell_security::{
@@ -1879,7 +1879,7 @@ mod tests {
 
     use super::{
         api_key_env_name, auth_context_for_inbound, build_router, command_prompt,
-        decode_hex_or_utf8, init_state, provider_config_with_llm_fallback,
+        decode_hex_or_utf8, execute_mock_tool, init_state, provider_config_with_llm_fallback,
         session_token_from_headers,
     };
 
@@ -2252,6 +2252,48 @@ mod tests {
             .any(|call| call.tool == "memory.write_candidate"
                 && call.summary.starts_with("provider tool mock-memory-write")));
         assert!(!run.audit.written_memory_ids.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn manual_memory_can_be_deleted_through_tool_runtime() {
+        let root = temp_root("memory-delete-tool");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let record = MemoryRecord::new(
+            indwell_memory::MemoryKind::Preference,
+            "user_unknown",
+            "preferences",
+            "User likes deliberate memory review.",
+            indwell_memory::MemorySource::Manual,
+            chrono::Utc::now().timestamp_millis() as u64,
+        );
+        let memory_id = record.id.clone();
+        state.memory.lock().await.append(record).unwrap();
+
+        let execution = execute_mock_tool(
+            &state,
+            "memory.delete",
+            json!({
+                "id": memory_id,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.output["deleted"], true);
+        let records = state
+            .memory
+            .lock()
+            .await
+            .search(MemoryQuery {
+                wing: Some("user_unknown".to_string()),
+                room: Some("preferences".to_string()),
+                text: Some("deliberate memory review".to_string()),
+                limit: Some(10),
+            })
+            .unwrap();
+        assert!(records.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
