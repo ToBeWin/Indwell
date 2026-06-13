@@ -16,6 +16,8 @@ Implemented in host simulator:
 - channel policy defaults for local, LAN, chat apps, MQTT, Home Assistant, and custom webhooks
 - mobile command normalization for command-style events
 - run audit for every channel input
+- public ingress quarantine for unauthenticated channel memory
+- mock-provider fallback for unauthenticated ingress when real providers are configured
 
 No project-owned relay is assumed or required.
 

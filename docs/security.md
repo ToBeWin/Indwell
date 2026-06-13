@@ -11,6 +11,8 @@ Phase 0 implements the policy shape that Proto v1 needs:
 - Pairing challenges create paired device records from a short-lived code plus optional Ed25519 proof.
 - Signed requests verify a paired device over method, path, timestamp, nonce, and body hash.
 - Session tokens are signed locally and required for protected host-sim routes.
+- Unauthenticated public ingress is forced to mock providers when real provider config exists.
+- Unauthenticated channel memories are quarantined under `inbox/unverified`.
 - Dynamic passphrase challenges can be verified once and converted into scoped confirmation grants.
 - Confirmation grants are subject-bound, tool-bound, expiring, and single-use.
 - OTA manifest signatures can be verified with Ed25519 public keys.
@@ -36,6 +38,13 @@ Public bootstrap routes:
 - `POST /v1/auth/passphrase/challenge`
 - `POST /v1/auth/passphrase/verify`
 - channel input and webhook routes for low-trust ingress testing
+
+Low-trust ingress routes are not allowed to spend user-owned model API keys.
+When the stored provider config points to a non-mock provider and the request
+does not carry a valid paired-device session, host-sim falls back to mock
+providers and records the downgrade in the run audit. Unauthenticated channel
+memory is written to `inbox/unverified` with an `unverified_ingress` tag rather
+than directly into the owner episode room.
 
 Protected routes require either:
 

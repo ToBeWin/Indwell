@@ -25,7 +25,7 @@ use indwell_core::{
 };
 use indwell_memory::{
     JsonlMemoryStore, MemoryExport, MemoryKind, MemoryMetabolismReport, MemoryQuery, MemoryRecord,
-    MemorySource, MemoryStore,
+    MemorySource, MemoryStore, Sensitivity, TtlPolicy,
 };
 use indwell_ota::{OtaManifest, OtaSlot, OtaTrustStore, OtaVerificationReport};
 use indwell_protocol::MobileCommand;
@@ -374,9 +374,12 @@ fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
 
 async fn channel_input(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ChannelInputRequest>,
 ) -> Result<Json<ApiEnvelope<ChannelInputResponse>>, AppError> {
-    let principal = match req.session_token.as_deref() {
+    let header_token = session_token_from_headers(&headers);
+    let token = req.session_token.as_deref().or(header_token.as_deref());
+    let principal = match token {
         Some(token) => Some(principal_from_session_token(&state, token).await?),
         None => None,
     };
@@ -406,6 +409,7 @@ async fn mock_voice_turn(
     Json(req): Json<VoiceTurnRequest>,
 ) -> Result<Json<ApiEnvelope<VoiceTurnResponse>>, AppError> {
     let providers = state.providers.lock().await.load()?;
+    let providers = provider_config_for_ingress(&providers, &AuthContext::anonymous()).0;
     let transcript = transcribe_with_config(
         &state,
         &providers,
@@ -500,7 +504,12 @@ async fn handle_channel_event(
     apply_context_pack(&mut run, DeviceState::Thinking, assembly);
 
     let providers = state.providers.lock().await.load()?;
+    let (providers, provider_policy_note) =
+        provider_config_for_ingress(&providers, &run.auth_context);
     run.provider.llm = format!("{}:{}", providers.llm.kind, providers.llm.model);
+    if let Some(note) = provider_policy_note {
+        run.record_policy_block(note);
+    }
     let api_key = match providers.llm.api_key_ref.as_deref() {
         Some(key_ref) => resolve_api_key(&state, key_ref).await?,
         None => None,
@@ -542,10 +551,12 @@ async fn handle_channel_event(
     }
 
     let memory_id = if !text.trim().is_empty() {
+        let owner_authenticated = run.auth_context.owner_authenticated;
+        let (wing, room) = memory_target_for_ingress(&run.auth_context);
         let mut record = MemoryRecord::new(
             MemoryKind::Episodic,
-            "user_unknown",
-            "episodes",
+            wing,
+            room,
             format!("{} -> {}", text, reply),
             MemorySource::AgentRun {
                 run_id: run.id.to_string(),
@@ -553,6 +564,13 @@ async fn handle_channel_event(
             Utc::now().timestamp_millis() as u64,
         );
         record.tags.push(format!("channel:{:?}", event.channel()));
+        if !owner_authenticated {
+            record.tags.push("unverified_ingress".to_string());
+            record.confidence = 0.35;
+            record.importance = 0.2;
+            record.sensitivity = Sensitivity::Personal;
+            record.ttl_policy = TtlPolicy::Review;
+        }
         let id = record.id.clone();
         state.memory.lock().await.append(record)?;
         run.record_written_memory(id.clone());
@@ -583,6 +601,72 @@ fn auth_context_for_inbound(inbound: &ChannelInbound) -> AuthContext {
         }
     } else {
         AuthContext::anonymous()
+    }
+}
+
+fn provider_config_for_ingress(
+    providers: &ProviderConfigSet,
+    auth: &AuthContext,
+) -> (ProviderConfigSet, Option<String>) {
+    if auth.owner_authenticated || !provider_set_uses_external_provider(providers) {
+        return (providers.clone(), None);
+    }
+
+    (
+        mock_provider_config(),
+        Some(
+            "unauthenticated ingress forced to mock provider to protect user-owned API keys"
+                .to_string(),
+        ),
+    )
+}
+
+fn provider_set_uses_external_provider(providers: &ProviderConfigSet) -> bool {
+    provider_kind_is_external(&providers.llm.kind)
+        || providers
+            .vision
+            .as_ref()
+            .is_some_and(|provider| provider_kind_is_external(&provider.kind))
+        || providers
+            .asr
+            .as_ref()
+            .is_some_and(|provider| provider_kind_is_external(&provider.kind))
+        || providers
+            .tts
+            .as_ref()
+            .is_some_and(|provider| provider_kind_is_external(&provider.kind))
+        || providers
+            .embedding
+            .as_ref()
+            .is_some_and(|provider| provider_kind_is_external(&provider.kind))
+}
+
+fn provider_kind_is_external(kind: &str) -> bool {
+    !matches!(kind, "mock")
+}
+
+fn mock_provider_config() -> ProviderConfigSet {
+    ProviderConfigSet {
+        llm: ProviderConfig {
+            kind: "mock".to_string(),
+            base_url: None,
+            api_key_ref: None,
+            model: "mock:phase0".to_string(),
+            max_input_tokens: Some(4000),
+            max_output_tokens: Some(600),
+        },
+        vision: None,
+        asr: None,
+        tts: None,
+        embedding: None,
+    }
+}
+
+fn memory_target_for_ingress(auth: &AuthContext) -> (&'static str, &'static str) {
+    if auth.owner_authenticated {
+        ("user_unknown", "episodes")
+    } else {
+        ("inbox", "unverified")
     }
 }
 
@@ -1727,8 +1811,11 @@ mod tests {
     };
     use ed25519_dalek::{Signer, SigningKey};
     use indwell_channel::{ChannelInbound, ChannelKind, ChannelPrincipal};
-    use indwell_protocol::{MobileCommand, ProviderConfig};
-    use indwell_security::{pairing_signature_payload, signed_request_payload, SignedRequest};
+    use indwell_memory::{MemoryQuery, MemoryStore};
+    use indwell_protocol::{MobileCommand, ProviderConfig, ProviderConfigSet};
+    use indwell_security::{
+        pairing_signature_payload, signed_request_payload, PairedDevice, SignedRequest,
+    };
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
@@ -2005,6 +2092,165 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn unauthenticated_channel_input_uses_mock_provider_and_quarantines_memory() {
+        let root = temp_root("public-ingress");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        state
+            .providers
+            .lock()
+            .await
+            .save(&external_provider_config())
+            .unwrap();
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/channel/input")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "session_id": "public-test",
+                            "subject_hint": "owner",
+                            "text": "remember my quiet morning preference",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = response_data(response).await;
+        assert!(data["reply"]
+            .as_str()
+            .unwrap()
+            .starts_with("Indwell mock response"));
+
+        let records = state
+            .memory
+            .lock()
+            .await
+            .search(MemoryQuery {
+                wing: Some("inbox".to_string()),
+                room: Some("unverified".to_string()),
+                text: Some("quiet morning".to_string()),
+                limit: Some(10),
+            })
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0]
+            .tags
+            .iter()
+            .any(|tag| tag == "unverified_ingress"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn channel_input_accepts_bearer_session_for_owner_memory() {
+        let root = temp_root("authenticated-channel");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let device = test_paired_device();
+        let (_session, token) = state
+            .sessions
+            .lock()
+            .await
+            .issue(
+                &device,
+                "owner",
+                chrono::Utc::now().timestamp_millis() as u64,
+                60_000,
+            )
+            .unwrap();
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/channel/input")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "session_id": "authenticated-test",
+                            "subject_hint": "owner",
+                            "text": "remember I like verified mornings",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let records = state
+            .memory
+            .lock()
+            .await
+            .search(MemoryQuery {
+                wing: Some("user_unknown".to_string()),
+                room: Some("episodes".to_string()),
+                text: Some("verified mornings".to_string()),
+                limit: Some(10),
+            })
+            .unwrap();
+        assert!(!records.is_empty());
+        assert!(records
+            .iter()
+            .all(|record| !record.tags.iter().any(|tag| tag == "unverified_ingress")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn public_voice_mock_turn_does_not_call_external_provider() {
+        let root = temp_root("public-voice");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        state
+            .providers
+            .lock()
+            .await
+            .save(&external_provider_config())
+            .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/voice/mock-turn")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "text_hint": "hello from public voice",
+                            "voice": "warm_indwell",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = response_data(response).await;
+        assert!(data["reply"]
+            .as_str()
+            .unwrap()
+            .starts_with("Indwell mock response"));
+        assert_eq!(data["audio"]["mime_type"].as_str(), Some("audio/wav"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn temp_root(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("indwell-host-sim-{name}-{}", uuid::Uuid::new_v4()))
     }
@@ -2020,5 +2266,34 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    fn external_provider_config() -> ProviderConfigSet {
+        ProviderConfigSet {
+            llm: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                base_url: Some("https://api.example.invalid/v1".to_string()),
+                api_key_ref: Some("key_llm_main".to_string()),
+                model: "external-model".to_string(),
+                max_input_tokens: Some(4000),
+                max_output_tokens: Some(600),
+            },
+            vision: None,
+            asr: None,
+            tts: None,
+            embedding: None,
+        }
+    }
+
+    fn test_paired_device() -> PairedDevice {
+        PairedDevice {
+            device_id: "test-device".to_string(),
+            label: "Test device".to_string(),
+            public_key_hash: "test-key".to_string(),
+            public_key: vec![9_u8; 32],
+            paired_at_ms: 1,
+            last_seen_at_ms: Some(1),
+            revoked_at_ms: None,
+        }
     }
 }

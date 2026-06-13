@@ -88,6 +88,7 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 - Reflection Engine: derives preference, relationship, emotional, and skill memories from episodic records with source tags.
 - Channel gateway: local PWA, LAN/BLE/USB style channels, chat app style channels, MQTT/Home Assistant/custom webhook normalization.
 - Policy engine: tool risk levels, owner checks, high-risk confirmation gates, public-channel camera blocking.
+- Public ingress guard: unauthenticated channel and mock voice ingress cannot spend user-owned provider keys; unverified input is quarantined in `inbox/unverified`.
 - Agent run audit: trigger, retrieved memories, written memories, exposed tools, policy blocks, provider output summary.
 - Provider config: local JSON config with API key references, rejecting raw API keys in config.
 - Provider runtime: mock by default, plus OpenAI-compatible HTTP chat, vision, ASR, TTS, and embedding paths for host/desktop.
@@ -128,6 +129,11 @@ x-indwell-session-token: <session-token>
 The host simulator can issue a session after a paired device signs an
 `indwell-request-v1` payload. High-risk tools such as OTA apply additionally
 need a passphrase-derived confirmation grant bound to the exact tool name.
+
+Unauthenticated public ingress remains available for local smoke tests, but it
+is deliberately constrained: if a real provider is configured, public channel
+input and mock voice turns are forced to mock providers, and unauthenticated
+channel memories are written to `inbox/unverified` for later review.
 
 ## Verification
 
