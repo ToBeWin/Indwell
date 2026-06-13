@@ -147,4 +147,64 @@ mod tests {
         config.llm.api_key_ref = Some("key_llm_main".to_string());
         store.save(&config).unwrap();
     }
+
+    #[test]
+    fn round_trips_optional_provider_configs() {
+        let root =
+            std::env::temp_dir().join(format!("indwell-provider-config-{}", uuid::Uuid::new_v4()));
+        let store = JsonProviderConfigStore::new(root).unwrap();
+        let config = ProviderConfigSet {
+            llm: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                base_url: Some("https://api.example.com/v1".to_string()),
+                api_key_ref: Some("key_llm_main".to_string()),
+                model: "chat-model".to_string(),
+                max_input_tokens: Some(4000),
+                max_output_tokens: Some(600),
+            },
+            vision: Some(ProviderConfig {
+                kind: "same_as_llm".to_string(),
+                base_url: None,
+                api_key_ref: None,
+                model: "vision-model".to_string(),
+                max_input_tokens: None,
+                max_output_tokens: None,
+            }),
+            asr: Some(ProviderConfig {
+                kind: "same_as_llm".to_string(),
+                base_url: None,
+                api_key_ref: None,
+                model: "whisper-compatible".to_string(),
+                max_input_tokens: None,
+                max_output_tokens: None,
+            }),
+            tts: Some(ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                base_url: Some("https://speech.example.com/v1".to_string()),
+                api_key_ref: Some("key_tts_main".to_string()),
+                model: "tts-model".to_string(),
+                max_input_tokens: None,
+                max_output_tokens: None,
+            }),
+            embedding: Some(ProviderConfig {
+                kind: "mock".to_string(),
+                base_url: None,
+                api_key_ref: None,
+                model: "mock:embedding".to_string(),
+                max_input_tokens: None,
+                max_output_tokens: None,
+            }),
+        };
+
+        store.save(&config).unwrap();
+        let loaded = store.load().unwrap();
+
+        assert_eq!(loaded.vision.unwrap().kind, "same_as_llm");
+        assert_eq!(loaded.asr.unwrap().model, "whisper-compatible");
+        assert_eq!(
+            loaded.tts.unwrap().api_key_ref.as_deref(),
+            Some("key_tts_main")
+        );
+        assert_eq!(loaded.embedding.unwrap().kind, "mock");
+    }
 }

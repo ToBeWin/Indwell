@@ -18,6 +18,22 @@ const els = {
   providerApiKeyRef: document.querySelector("#providerApiKeyRef"),
   providerApiKeySecret: document.querySelector("#providerApiKeySecret"),
   providerMaxOutput: document.querySelector("#providerMaxOutput"),
+  providerVisionKind: document.querySelector("#providerVisionKind"),
+  providerVisionModel: document.querySelector("#providerVisionModel"),
+  providerVisionBaseUrl: document.querySelector("#providerVisionBaseUrl"),
+  providerVisionApiKeyRef: document.querySelector("#providerVisionApiKeyRef"),
+  providerAsrKind: document.querySelector("#providerAsrKind"),
+  providerAsrModel: document.querySelector("#providerAsrModel"),
+  providerAsrBaseUrl: document.querySelector("#providerAsrBaseUrl"),
+  providerAsrApiKeyRef: document.querySelector("#providerAsrApiKeyRef"),
+  providerTtsKind: document.querySelector("#providerTtsKind"),
+  providerTtsModel: document.querySelector("#providerTtsModel"),
+  providerTtsBaseUrl: document.querySelector("#providerTtsBaseUrl"),
+  providerTtsApiKeyRef: document.querySelector("#providerTtsApiKeyRef"),
+  providerEmbeddingKind: document.querySelector("#providerEmbeddingKind"),
+  providerEmbeddingModel: document.querySelector("#providerEmbeddingModel"),
+  providerEmbeddingBaseUrl: document.querySelector("#providerEmbeddingBaseUrl"),
+  providerEmbeddingApiKeyRef: document.querySelector("#providerEmbeddingApiKeyRef"),
   saveSecretButton: document.querySelector("#saveSecretButton"),
   providerResult: document.querySelector("#providerResult"),
   provisioningForm: document.querySelector("#provisioningForm"),
@@ -411,6 +427,64 @@ async function checkHealth() {
   }
 }
 
+const OPTIONAL_PROVIDER_FIELDS = {
+  vision: {
+    kind: "providerVisionKind",
+    model: "providerVisionModel",
+    baseUrl: "providerVisionBaseUrl",
+    apiKeyRef: "providerVisionApiKeyRef",
+  },
+  asr: {
+    kind: "providerAsrKind",
+    model: "providerAsrModel",
+    baseUrl: "providerAsrBaseUrl",
+    apiKeyRef: "providerAsrApiKeyRef",
+  },
+  tts: {
+    kind: "providerTtsKind",
+    model: "providerTtsModel",
+    baseUrl: "providerTtsBaseUrl",
+    apiKeyRef: "providerTtsApiKeyRef",
+  },
+  embedding: {
+    kind: "providerEmbeddingKind",
+    model: "providerEmbeddingModel",
+    baseUrl: "providerEmbeddingBaseUrl",
+    apiKeyRef: "providerEmbeddingApiKeyRef",
+  },
+};
+
+function setOptionalProviderFields(name, config) {
+  const fields = OPTIONAL_PROVIDER_FIELDS[name];
+  els[fields.kind].value = config?.kind || "";
+  els[fields.model].value = config?.model || "";
+  els[fields.baseUrl].value = config?.base_url || "";
+  els[fields.apiKeyRef].value = config?.api_key_ref || "";
+}
+
+function collectOptionalProvider(name) {
+  const fields = OPTIONAL_PROVIDER_FIELDS[name];
+  const kind = els[fields.kind].value.trim();
+  if (!kind) {
+    return null;
+  }
+  return {
+    kind,
+    base_url: els[fields.baseUrl].value.trim() || null,
+    api_key_ref: els[fields.apiKeyRef].value.trim() || null,
+    model: els[fields.model].value.trim(),
+    max_input_tokens: null,
+    max_output_tokens: null,
+  };
+}
+
+function providerSummary(label, config) {
+  if (!config) {
+    return `<div><dt>${escapeHtml(label)}</dt><dd>disabled</dd></div>`;
+  }
+  return `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(config.kind)} · ${escapeHtml(config.model || "inherits model")}</dd></div>`;
+}
+
 function renderProviderConfig(config) {
   const llm = config.llm || {};
   els.providerKind.value = llm.kind || "mock";
@@ -418,13 +492,20 @@ function renderProviderConfig(config) {
   els.providerBaseUrl.value = llm.base_url || "";
   els.providerApiKeyRef.value = llm.api_key_ref || "";
   els.providerMaxOutput.value = llm.max_output_tokens || 600;
+  setOptionalProviderFields("vision", config.vision);
+  setOptionalProviderFields("asr", config.asr);
+  setOptionalProviderFields("tts", config.tts);
+  setOptionalProviderFields("embedding", config.embedding);
 
   els.providerResult.classList.remove("empty");
   els.providerResult.innerHTML = `
     <dl class="kv">
-      <div><dt>Kind</dt><dd>${escapeHtml(llm.kind || "unknown")}</dd></div>
-      <div><dt>Model</dt><dd>${escapeHtml(llm.model || "unknown")}</dd></div>
+      <div><dt>LLM</dt><dd>${escapeHtml(llm.kind || "unknown")} · ${escapeHtml(llm.model || "unknown")}</dd></div>
       <div><dt>Key ref</dt><dd>${escapeHtml(llm.api_key_ref || "none")}</dd></div>
+      ${providerSummary("Vision", config.vision)}
+      ${providerSummary("ASR", config.asr)}
+      ${providerSummary("TTS", config.tts)}
+      ${providerSummary("Embedding", config.embedding)}
     </dl>
     <pre class="json-preview">${escapeHtml(formatJson(config))}</pre>
   `;
@@ -480,10 +561,10 @@ function collectProviderConfig() {
       max_input_tokens: 4000,
       max_output_tokens: Number.isFinite(maxOutput) ? maxOutput : null,
     },
-    vision: null,
-    asr: null,
-    tts: null,
-    embedding: null,
+    vision: collectOptionalProvider("vision"),
+    asr: collectOptionalProvider("asr"),
+    tts: collectOptionalProvider("tts"),
+    embedding: collectOptionalProvider("embedding"),
   };
 }
 

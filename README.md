@@ -97,7 +97,7 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 - Confirmation grants: high-risk tools require a valid session plus a scoped, single-use passphrase grant.
 - Tool runtime: provider-returned structured tool calls, planner fallback, status, LED, speaker, camera capture mock, sensor read mock, memory search/write/delete, identity, confirmation, OTA check.
 - OTA: local manifest store, shape checks, HTTPS URL check, SHA-256 format check, Ed25519 manifest signature verification, apply plan, slot alternation.
-- Console PWA: provider config, channel input, custom webhook, memory add/search/delete/export/JSON inspection, tool catalog/runtime, OTA manifest/check, run audit, raw API log.
+- Console PWA: LLM/Vision/ASR/TTS/Embedding provider config, channel input, custom webhook, memory add/search/delete/export/JSON inspection, tool catalog/runtime, OTA manifest/check, run audit, raw API log.
 - Firmware scaffold: ESP32-S3 boot plan, HAL boundary, partition table, and sdkconfig defaults.
 - ESP-IDF driver map: Proto v1 peripheral bindings to HAL traits.
 - Protocol provisioning schema: Wi-Fi password references and provider config without raw secrets.
@@ -110,7 +110,7 @@ Provider config stores `api_key_ref`, not raw API keys. In the host simulator, e
 export INDWELL_SECRET_KEY_LLM_MAIN="..."
 ```
 
-Then set provider kind to `openai_compatible`, base URL to a compatible `/v1` endpoint, and model to the target model name.
+Then set provider kind to `openai_compatible`, base URL to a compatible `/v1` endpoint, and model to the target model name. Vision, ASR, TTS, and Embedding providers can be disabled, set to `mock`, inherit LLM connection details with `same_as_llm`, or use their own OpenAI-compatible connection.
 
 ## Protected API Auth
 

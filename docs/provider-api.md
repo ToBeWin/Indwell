@@ -24,4 +24,9 @@ Provider config uses `api_key_ref`. In host simulator, the ref can be resolved f
 - PWA secret storage endpoint for the current process
 - environment variable, for example `INDWELL_SECRET_KEY_LLM_MAIN`
 
+The PWA can configure LLM, Vision, ASR, TTS, and Embedding providers. Optional
+providers may be disabled, set to `mock`, set to `same_as_llm` to inherit the
+LLM base URL and key ref, or configured as independent `openai_compatible`
+providers.
+
 Firmware should call providers directly through ESP-IDF HTTP/TLS clients or delegate heavier speech/vision providers to the paired phone/local gateway, without any project-owned proxy.

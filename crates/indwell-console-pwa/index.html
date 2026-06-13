@@ -50,11 +50,11 @@
           <form id="providerForm" class="stack">
             <div class="two-column">
               <label>
-                Kind
+                LLM kind
                 <input id="providerKind" name="providerKind" type="text" value="mock">
               </label>
               <label>
-                Model
+                LLM model
                 <input id="providerModel" name="providerModel" type="text" value="mock:phase0">
               </label>
             </div>
@@ -74,6 +74,88 @@
             <div class="inline-control">
               <input id="providerApiKeySecret" name="providerApiKeySecret" type="password" placeholder="Stored in host-sim memory only" autocomplete="current-password">
               <button id="saveSecretButton" class="secondary" type="button">Store secret</button>
+            </div>
+            <div class="provider-matrix">
+              <section class="provider-subsection" aria-labelledby="vision-provider-title">
+                <h3 id="vision-provider-title">Vision</h3>
+                <div class="two-column">
+                  <label>
+                    Kind
+                    <select id="providerVisionKind" name="providerVisionKind">
+                      <option value="">Disabled</option>
+                      <option value="same_as_llm">Same as LLM</option>
+                      <option value="mock">Mock</option>
+                      <option value="openai_compatible">OpenAI compatible</option>
+                    </select>
+                  </label>
+                  <label>
+                    Model
+                    <input id="providerVisionModel" name="providerVisionModel" type="text" placeholder="vision-model">
+                  </label>
+                </div>
+                <input id="providerVisionBaseUrl" name="providerVisionBaseUrl" type="url" placeholder="Base URL override">
+                <input id="providerVisionApiKeyRef" name="providerVisionApiKeyRef" type="text" placeholder="API key ref override">
+              </section>
+              <section class="provider-subsection" aria-labelledby="asr-provider-title">
+                <h3 id="asr-provider-title">ASR</h3>
+                <div class="two-column">
+                  <label>
+                    Kind
+                    <select id="providerAsrKind" name="providerAsrKind">
+                      <option value="">Disabled</option>
+                      <option value="same_as_llm">Same as LLM</option>
+                      <option value="mock">Mock</option>
+                      <option value="openai_compatible">OpenAI compatible</option>
+                    </select>
+                  </label>
+                  <label>
+                    Model
+                    <input id="providerAsrModel" name="providerAsrModel" type="text" placeholder="whisper-compatible">
+                  </label>
+                </div>
+                <input id="providerAsrBaseUrl" name="providerAsrBaseUrl" type="url" placeholder="Base URL override">
+                <input id="providerAsrApiKeyRef" name="providerAsrApiKeyRef" type="text" placeholder="API key ref override">
+              </section>
+              <section class="provider-subsection" aria-labelledby="tts-provider-title">
+                <h3 id="tts-provider-title">TTS</h3>
+                <div class="two-column">
+                  <label>
+                    Kind
+                    <select id="providerTtsKind" name="providerTtsKind">
+                      <option value="">Disabled</option>
+                      <option value="same_as_llm">Same as LLM</option>
+                      <option value="mock">Mock</option>
+                      <option value="openai_compatible">OpenAI compatible</option>
+                    </select>
+                  </label>
+                  <label>
+                    Model
+                    <input id="providerTtsModel" name="providerTtsModel" type="text" placeholder="tts-model">
+                  </label>
+                </div>
+                <input id="providerTtsBaseUrl" name="providerTtsBaseUrl" type="url" placeholder="Base URL override">
+                <input id="providerTtsApiKeyRef" name="providerTtsApiKeyRef" type="text" placeholder="API key ref override">
+              </section>
+              <section class="provider-subsection" aria-labelledby="embedding-provider-title">
+                <h3 id="embedding-provider-title">Embedding</h3>
+                <div class="two-column">
+                  <label>
+                    Kind
+                    <select id="providerEmbeddingKind" name="providerEmbeddingKind">
+                      <option value="">Disabled</option>
+                      <option value="same_as_llm">Same as LLM</option>
+                      <option value="mock">Mock</option>
+                      <option value="openai_compatible">OpenAI compatible</option>
+                    </select>
+                  </label>
+                  <label>
+                    Model
+                    <input id="providerEmbeddingModel" name="providerEmbeddingModel" type="text" placeholder="embedding-model">
+                  </label>
+                </div>
+                <input id="providerEmbeddingBaseUrl" name="providerEmbeddingBaseUrl" type="url" placeholder="Base URL override">
+                <input id="providerEmbeddingApiKeyRef" name="providerEmbeddingApiKeyRef" type="text" placeholder="API key ref override">
+              </section>
             </div>
             <button type="submit">Save provider config</button>
           </form>
