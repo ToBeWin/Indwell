@@ -226,6 +226,21 @@ async fn main() -> anyhow::Result<()> {
     let data_root = std::env::var("INDWELL_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("data/host-sim"));
+    let state = init_state(data_root)?;
+    let app = build_router(state);
+
+    let addr: SocketAddr = std::env::var("INDWELL_HOST_SIM_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:3030".to_string())
+        .parse()?;
+    tracing::info!("Indwell host simulator listening on http://{addr}");
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+fn init_state(data_root: PathBuf) -> anyhow::Result<AppState> {
     let memory = JsonlMemoryStore::new(data_root.join("memory"))?;
     let runs = JsonlRunStore::new(data_root.join("runs"))?;
     let providers = JsonProviderConfigStore::new(data_root.join("config"))?;
@@ -242,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
             .as_deref(),
     ));
 
-    let state = AppState {
+    Ok(AppState {
         memory: Arc::new(Mutex::new(memory)),
         runs: Arc::new(Mutex::new(runs)),
         providers: Arc::new(Mutex::new(providers)),
@@ -256,8 +271,10 @@ async fn main() -> anyhow::Result<()> {
         ota: Arc::new(Mutex::new(ota)),
         context: Arc::new(ContextAssembler::default()),
         policy: Arc::new(PolicyEngine),
-    };
+    })
+}
 
+fn build_router(state: AppState) -> Router {
     let public_routes = Router::new()
         .route("/health", get(health))
         .route("/v1/channel/input", post(channel_input))
@@ -311,16 +328,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
-
-    let addr: SocketAddr = std::env::var("INDWELL_HOST_SIM_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:3030".to_string())
-        .parse()?;
-    tracing::info!("Indwell host simulator listening on http://{addr}");
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    app
 }
 
 async fn health() -> Json<ApiEnvelope<HealthResponse>> {
@@ -1710,13 +1718,18 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{header, HeaderMap, HeaderValue};
+    use axum::{
+        body::Body,
+        http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+    };
     use indwell_channel::{ChannelInbound, ChannelKind, ChannelPrincipal};
     use indwell_protocol::{MobileCommand, ProviderConfig};
+    use tower::ServiceExt;
 
     use super::{
-        api_key_env_name, auth_context_for_inbound, command_prompt, decode_hex_or_utf8,
-        provider_config_with_llm_fallback, session_token_from_headers,
+        api_key_env_name, auth_context_for_inbound, build_router, command_prompt,
+        decode_hex_or_utf8, init_state, provider_config_with_llm_fallback,
+        session_token_from_headers,
     };
 
     #[test]
@@ -1836,5 +1849,49 @@ mod tests {
             session_token_from_headers(&headers).as_deref(),
             Some("session-token-2")
         );
+    }
+
+    #[tokio::test]
+    async fn public_health_route_does_not_require_session() {
+        let root = temp_root("health");
+        let _ = std::fs::remove_dir_all(&root);
+        let app = build_router(init_state(root.clone()).unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn protected_memory_route_requires_session() {
+        let root = temp_root("protected-memory");
+        let _ = std::fs::remove_dir_all(&root);
+        let app = build_router(init_state(root.clone()).unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/memory/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("indwell-host-sim-{name}-{}", uuid::Uuid::new_v4()))
     }
 }
