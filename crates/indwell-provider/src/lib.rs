@@ -4,15 +4,31 @@ use reqwest::{multipart, Client, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +89,12 @@ impl OpenAiCompatibleProvider {
                 .map(OpenAiCompatibleChatMessage::from)
                 .collect(),
             max_tokens: self.config.max_output_tokens,
+            tools: req
+                .tools
+                .into_iter()
+                .map(OpenAiCompatibleTool::from)
+                .collect(),
+            tool_choice: None,
         }
     }
 
@@ -335,12 +357,30 @@ pub struct OpenAiCompatibleChatRequest {
     pub messages: Vec<OpenAiCompatibleChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<OpenAiCompatibleTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenAiCompatibleChatMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenAiCompatibleTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: OpenAiCompatibleToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenAiCompatibleToolFunction {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -400,9 +440,24 @@ impl From<ChatMessage> for OpenAiCompatibleChatMessage {
     }
 }
 
+impl From<ToolSpec> for OpenAiCompatibleTool {
+    fn from(tool: ToolSpec) -> Self {
+        Self {
+            kind: "function".to_string(),
+            function: OpenAiCompatibleToolFunction {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.input_schema,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatResponse {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -457,6 +512,20 @@ struct OpenAiCompatibleChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiCompatibleAssistantMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiCompatibleToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatibleToolCall {
+    id: Option<String>,
+    function: OpenAiCompatibleToolCallFunction,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompatibleToolCallFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,14 +547,38 @@ struct OpenAiCompatibleEmbeddingData {
 pub fn parse_openai_compatible_chat_response(body: &str) -> Result<ChatResponse, ProviderError> {
     let parsed: OpenAiCompatibleChatResponse =
         serde_json::from_str(body).map_err(ProviderError::ResponseParse)?;
-    let text = parsed
+    let message = parsed
         .choices
         .into_iter()
-        .find_map(|choice| choice.message.content)
-        .filter(|content| !content.is_empty())
+        .map(|choice| choice.message)
+        .find(|message| {
+            message
+                .content
+                .as_ref()
+                .is_some_and(|content| !content.is_empty())
+                || !message.tool_calls.is_empty()
+        })
         .ok_or(ProviderError::MissingAssistantMessage)?;
+    let text = message.content.unwrap_or_default();
+    let tool_calls = message
+        .tool_calls
+        .into_iter()
+        .map(|call| {
+            let arguments = if call.function.arguments.trim().is_empty() {
+                serde_json::Value::Object(Default::default())
+            } else {
+                serde_json::from_str(&call.function.arguments)
+                    .map_err(ProviderError::ResponseParse)?
+            };
+            Ok(ToolCall {
+                id: call.id.unwrap_or_else(|| call.function.name.clone()),
+                name: call.function.name,
+                arguments,
+            })
+        })
+        .collect::<Result<Vec<_>, ProviderError>>()?;
 
-    Ok(ChatResponse { text })
+    Ok(ChatResponse { text, tool_calls })
 }
 
 pub fn parse_openai_compatible_transcript_response(
@@ -582,6 +675,7 @@ impl LlmProvider for MockLlmProvider {
             .unwrap_or("");
         Ok(ChatResponse {
             text: format!("Indwell mock response: {}", last),
+            tool_calls: mock_tool_calls_from_text(last),
         })
     }
 
@@ -594,6 +688,61 @@ impl LlmProvider for MockLlmProvider {
             embeddings: false,
         }
     }
+}
+
+fn mock_tool_calls_from_text(text: &str) -> Vec<ToolCall> {
+    let normalized = text.to_lowercase();
+    if normalized.contains("remember") || normalized.contains("记住") {
+        return vec![ToolCall {
+            id: "mock-memory-write".to_string(),
+            name: "memory.write_candidate".to_string(),
+            arguments: serde_json::json!({
+                "wing": "user_unknown",
+                "room": "episodes",
+                "content": text,
+            }),
+        }];
+    }
+
+    if normalized.contains("camera")
+        || normalized.contains("photo")
+        || normalized.contains("image")
+        || normalized.contains("拍照")
+        || normalized.contains("看看")
+    {
+        return vec![ToolCall {
+            id: "mock-camera-capture".to_string(),
+            name: "device.camera.capture".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+    }
+
+    if normalized.contains("temperature")
+        || normalized.contains("sensor")
+        || normalized.contains("温度")
+    {
+        return vec![ToolCall {
+            id: "mock-sensor-read".to_string(),
+            name: "device.sensor.read".to_string(),
+            arguments: serde_json::json!({
+                "sensor": if normalized.contains("temperature") || normalized.contains("温度") {
+                    "temperature"
+                } else {
+                    "ambient_light"
+                },
+            }),
+        }];
+    }
+
+    if normalized.contains("status") || normalized.contains("状态") {
+        return vec![ToolCall {
+            id: "mock-system-status".to_string(),
+            name: "system.status".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+    }
+
+    Vec::new()
 }
 
 #[derive(Debug, Clone)]
@@ -706,6 +855,7 @@ mod tests {
                     content: "Hello from the device.".to_string(),
                 },
             ],
+            tools: Vec::new(),
         });
 
         let serialized = serde_json::to_value(body).expect("request should serialize");
@@ -726,6 +876,38 @@ mod tests {
                 ],
                 "max_tokens": 600
             })
+        );
+    }
+
+    #[test]
+    fn serializes_tools_in_openai_compatible_shape() {
+        let body = provider().build_chat_request(ChatRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "remember this".to_string(),
+            }],
+            tools: vec![ToolSpec {
+                name: "memory.write_candidate".to_string(),
+                description: "Write a candidate memory.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string" }
+                    },
+                    "required": ["content"]
+                }),
+            }],
+        });
+
+        let serialized = serde_json::to_value(body).expect("request should serialize");
+        assert_eq!(serialized["tools"][0]["type"], "function");
+        assert_eq!(
+            serialized["tools"][0]["function"]["name"],
+            "memory.write_candidate"
+        );
+        assert_eq!(
+            serialized["tools"][0]["function"]["parameters"]["required"][0],
+            "content"
         );
     }
 
@@ -784,6 +966,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "Ping".to_string(),
             }],
+            tools: Vec::new(),
         }))
         .expect("request should serialize");
 
@@ -822,6 +1005,42 @@ mod tests {
         .expect("response should parse");
 
         assert_eq!(response.text, "Hello from the real provider path.");
+    }
+
+    #[test]
+    fn parses_openai_compatible_tool_call_response() {
+        let response = parse_openai_compatible_chat_response(
+            r#"{
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "memory.write_candidate",
+                                        "arguments": "{\"content\":\"quiet mornings\",\"wing\":\"user_unknown\"}"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("tool call response should parse");
+
+        assert_eq!(response.text, "");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "memory.write_candidate");
+        assert_eq!(
+            response.tool_calls[0].arguments["content"],
+            "quiet mornings"
+        );
     }
 
     #[test]
@@ -898,6 +1117,7 @@ mod tests {
                     role: "user".to_string(),
                     content: "Ping".to_string(),
                 }],
+                tools: Vec::new(),
             })
             .await
             .expect_err("missing base url should fail");
@@ -922,6 +1142,7 @@ mod tests {
                     role: "user".to_string(),
                     content: "Ping".to_string(),
                 }],
+                tools: Vec::new(),
             })
             .await
             .expect_err("missing api key should fail");
@@ -952,6 +1173,7 @@ mod tests {
                     role: "user".to_string(),
                     content: "Ping".to_string(),
                 }],
+                tools: Vec::new(),
             })
             .await
             .expect("chat request should succeed");

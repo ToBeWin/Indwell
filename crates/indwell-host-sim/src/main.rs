@@ -35,8 +35,8 @@ use indwell_protocol::{
 };
 use indwell_provider::{
     AsrProvider, AudioBlob, ChatMessage, ChatRequest, LlmProvider, MockAsrProvider,
-    MockLlmProvider, MockTtsProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, Transcript,
-    TtsProvider, VoiceProfile,
+    MockLlmProvider, MockTtsProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall,
+    ToolSpec, Transcript, TtsProvider, VoiceProfile,
 };
 use indwell_reflection::{ReflectionBudget, ReflectionEngine, ReflectionReport};
 use indwell_runs::{JsonlRunStore, RunStore};
@@ -432,6 +432,7 @@ async fn mock_voice_turn(
                 role: "user".to_string(),
                 content: transcript.text.clone(),
             }],
+            tools: Vec::new(),
         },
     )
     .await?
@@ -514,7 +515,7 @@ async fn handle_channel_event(
         Some(key_ref) => resolve_api_key(&state, key_ref).await?,
         None => None,
     };
-    let reply = chat_with_config(
+    let chat_response = chat_with_config(
         &providers,
         api_key,
         ChatRequest {
@@ -522,32 +523,16 @@ async fn handle_channel_event(
                 role: "user".to_string(),
                 content: text.clone(),
             }],
+            tools: tool_specs_from_descriptors(&run.allowed_tools),
         },
     )
-    .await?
-    .text;
+    .await?;
+    let reply = chat_response.text;
 
-    let planned_tools = plan_tool_calls(&text, &run.allowed_tools);
-    for planned in planned_tools {
-        match execute_mock_tool(&state, &planned.tool, planned.input).await {
-            Ok(execution) => {
-                run.record_tool_call(
-                    &planned.tool,
-                    ToolAuditOutcome::Completed,
-                    format!("planned tool: {}", execution.summary),
-                );
-                if let Some(memory_id) = execution.memory_id {
-                    run.record_written_memory(memory_id);
-                }
-            }
-            Err(error) => {
-                run.record_tool_call(
-                    &planned.tool,
-                    ToolAuditOutcome::Failed,
-                    format!("planned tool failed: {error:?}"),
-                );
-            }
-        }
+    if chat_response.tool_calls.is_empty() {
+        execute_planned_tool_calls(&state, &mut run, &text).await;
+    } else {
+        execute_provider_tool_calls(&state, &mut run, chat_response.tool_calls).await;
     }
 
     let memory_id = if !text.trim().is_empty() {
@@ -694,6 +679,77 @@ fn command_prompt(command: &MobileCommand) -> String {
         MobileCommand::SystemStatus => "system status".to_string(),
         MobileCommand::CheckUpdate => "check update".to_string(),
         MobileCommand::ApplyUpdate { version } => format!("apply update {version}"),
+    }
+}
+
+fn tool_specs_from_descriptors(tools: &[ToolDescriptor]) -> Vec<ToolSpec> {
+    tools
+        .iter()
+        .map(|tool| ToolSpec {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            input_schema: tool_input_schema(&tool.name),
+        })
+        .collect()
+}
+
+async fn execute_planned_tool_calls(state: &AppState, run: &mut AgentRun, text: &str) {
+    let planned_tools = plan_tool_calls(text, &run.allowed_tools);
+    for planned in planned_tools {
+        match execute_mock_tool(state, &planned.tool, planned.input).await {
+            Ok(execution) => {
+                run.record_tool_call(
+                    &planned.tool,
+                    ToolAuditOutcome::Completed,
+                    format!("planned tool: {}", execution.summary),
+                );
+                if let Some(memory_id) = execution.memory_id {
+                    run.record_written_memory(memory_id);
+                }
+            }
+            Err(error) => {
+                run.record_tool_call(
+                    &planned.tool,
+                    ToolAuditOutcome::Failed,
+                    format!("planned tool failed: {error:?}"),
+                );
+            }
+        }
+    }
+}
+
+async fn execute_provider_tool_calls(
+    state: &AppState,
+    run: &mut AgentRun,
+    tool_calls: Vec<ToolCall>,
+) {
+    for call in tool_calls {
+        if !run.allowed_tools.iter().any(|tool| tool.name == call.name) {
+            let summary = format!("provider requested unavailable tool {}", call.name);
+            run.record_tool_call(&call.name, ToolAuditOutcome::Blocked, summary.clone());
+            run.record_policy_block(summary);
+            continue;
+        }
+
+        match execute_mock_tool(state, &call.name, call.arguments).await {
+            Ok(execution) => {
+                run.record_tool_call(
+                    &call.name,
+                    ToolAuditOutcome::Completed,
+                    format!("provider tool {}: {}", call.id, execution.summary),
+                );
+                if let Some(memory_id) = execution.memory_id {
+                    run.record_written_memory(memory_id);
+                }
+            }
+            Err(error) => {
+                run.record_tool_call(
+                    &call.name,
+                    ToolAuditOutcome::Failed,
+                    format!("provider tool {} failed: {error:?}", call.id),
+                );
+            }
+        }
     }
 }
 
@@ -1813,6 +1869,7 @@ mod tests {
     use indwell_channel::{ChannelInbound, ChannelKind, ChannelPrincipal};
     use indwell_memory::{MemoryQuery, MemoryStore};
     use indwell_protocol::{MobileCommand, ProviderConfig, ProviderConfigSet};
+    use indwell_runs::RunStore;
     use indwell_security::{
         pairing_signature_payload, signed_request_payload, PairedDevice, SignedRequest,
     };
@@ -2148,6 +2205,53 @@ mod tests {
             .tags
             .iter()
             .any(|tag| tag == "unverified_ingress"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn provider_tool_call_executes_and_is_audited() {
+        let root = temp_root("provider-tool-call");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/channel/input")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "session_id": "provider-tool-test",
+                            "subject_hint": null,
+                            "text": "remember that I like quiet blue lights",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = response_data(response).await;
+        let run_id = data["run_id"].as_str().unwrap();
+        let run = state
+            .runs
+            .lock()
+            .await
+            .get(uuid::Uuid::parse_str(run_id).unwrap())
+            .unwrap()
+            .expect("run should be stored");
+        assert!(run
+            .audit
+            .tool_calls
+            .iter()
+            .any(|call| call.tool == "memory.write_candidate"
+                && call.summary.starts_with("provider tool mock-memory-write")));
+        assert!(!run.audit.written_memory_ids.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 

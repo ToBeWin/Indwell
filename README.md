@@ -91,11 +91,11 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 - Public ingress guard: unauthenticated channel and mock voice ingress cannot spend user-owned provider keys; unverified input is quarantined in `inbox/unverified`.
 - Agent run audit: trigger, retrieved memories, written memories, exposed tools, policy blocks, provider output summary.
 - Provider config: local JSON config with API key references, rejecting raw API keys in config.
-- Provider runtime: mock by default, plus OpenAI-compatible HTTP chat, vision, ASR, TTS, and embedding paths for host/desktop.
+- Provider runtime: mock by default, plus OpenAI-compatible HTTP chat, structured tool calls, vision, ASR, TTS, and embedding paths for host/desktop.
 - Local secrets: host simulator seals local API secrets for an API key ref without returning the raw value.
 - Session auth: protected host-sim routes require a signed paired-device session token; the PWA can generate a browser Ed25519 keypair, complete signed pairing, and issue a session.
 - Confirmation grants: high-risk tools require a valid session plus a scoped, single-use passphrase grant.
-- Tool runtime: status, LED, speaker, camera capture mock, sensor read mock, memory search/write/delete, identity, confirmation, OTA check.
+- Tool runtime: provider-returned structured tool calls, planner fallback, status, LED, speaker, camera capture mock, sensor read mock, memory search/write/delete, identity, confirmation, OTA check.
 - OTA: local manifest store, shape checks, HTTPS URL check, SHA-256 format check, Ed25519 manifest signature verification, apply plan, slot alternation.
 - Console PWA: provider config, channel input, custom webhook, memory search/export, tool catalog/runtime, OTA manifest/check, run audit, raw API log.
 - Firmware scaffold: ESP32-S3 boot plan, HAL boundary, partition table, and sdkconfig defaults.

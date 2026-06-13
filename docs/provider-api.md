@@ -8,8 +8,16 @@ Implemented for host/desktop:
 - `OpenAiCompatibleProvider`
 - Request body serialization for `/chat/completions`
 - Response parsing from OpenAI-compatible `choices[].message.content`
+- OpenAI-compatible `tools` serialization from Indwell `ToolSpec`
+- OpenAI-compatible `choices[].message.tool_calls` parsing into provider-neutral `ToolCall`
 - API errors and response parse errors
 - Missing base URL and missing API key checks
+
+Host-sim Agent runs now send the current allowed tool subset to the LLM
+provider. If the provider returns structured tool calls, host-sim executes
+those calls through the local tool runtime and records the result in the
+AgentRun audit trail. The older keyword planner remains as a mock fallback when
+the provider returns plain text only.
 
 Provider config uses `api_key_ref`. In host simulator, the ref can be resolved from:
 
