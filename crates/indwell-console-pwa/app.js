@@ -35,6 +35,11 @@ const els = {
   providerEmbeddingBaseUrl: document.querySelector("#providerEmbeddingBaseUrl"),
   providerEmbeddingApiKeyRef: document.querySelector("#providerEmbeddingApiKeyRef"),
   saveSecretButton: document.querySelector("#saveSecretButton"),
+  testLlmProviderButton: document.querySelector("#testLlmProviderButton"),
+  testVisionProviderButton: document.querySelector("#testVisionProviderButton"),
+  testAsrProviderButton: document.querySelector("#testAsrProviderButton"),
+  testTtsProviderButton: document.querySelector("#testTtsProviderButton"),
+  testEmbeddingProviderButton: document.querySelector("#testEmbeddingProviderButton"),
   providerResult: document.querySelector("#providerResult"),
   provisioningForm: document.querySelector("#provisioningForm"),
   loadProvisioningButton: document.querySelector("#loadProvisioningButton"),
@@ -595,6 +600,34 @@ async function saveProviderSecret() {
     renderError(els.providerResult, error);
   } finally {
     setBusy(els.saveSecretButton, false);
+  }
+}
+
+async function testProvider(target, button) {
+  if (!requireSessionFor(els.providerResult, "provider diagnostics")) {
+    return;
+  }
+  setBusy(button, true);
+
+  try {
+    const result = await requestJson("/v1/providers/test", {
+      method: "POST",
+      body: { target },
+    });
+    els.providerResult.classList.remove("empty");
+    els.providerResult.innerHTML = `
+      <dl class="kv">
+        <div><dt>Target</dt><dd>${escapeHtml(result.target)}</dd></div>
+        <div><dt>Status</dt><dd>${result.ok ? "OK" : "Failed"}</dd></div>
+        <div><dt>Summary</dt><dd>${escapeHtml(result.summary)}</dd></div>
+        <div><dt>Provider</dt><dd>${escapeHtml(result.provider?.kind || "mock/default")}</dd></div>
+      </dl>
+      <pre class="json-preview">${escapeHtml(formatJson(result.details))}</pre>
+    `;
+  } catch (error) {
+    renderError(els.providerResult, error);
+  } finally {
+    setBusy(button, false);
   }
 }
 
@@ -1470,6 +1503,21 @@ els.connectionForm.addEventListener("submit", (event) => {
 els.providerForm.addEventListener("submit", saveProviderConfig);
 els.loadProviderButton.addEventListener("click", loadProviderConfig);
 els.saveSecretButton.addEventListener("click", saveProviderSecret);
+els.testLlmProviderButton.addEventListener("click", () =>
+  testProvider("llm", els.testLlmProviderButton)
+);
+els.testVisionProviderButton.addEventListener("click", () =>
+  testProvider("vision", els.testVisionProviderButton)
+);
+els.testAsrProviderButton.addEventListener("click", () =>
+  testProvider("asr", els.testAsrProviderButton)
+);
+els.testTtsProviderButton.addEventListener("click", () =>
+  testProvider("tts", els.testTtsProviderButton)
+);
+els.testEmbeddingProviderButton.addEventListener("click", () =>
+  testProvider("embedding", els.testEmbeddingProviderButton)
+);
 els.provisioningForm.addEventListener("submit", saveProvisioning);
 els.loadProvisioningButton.addEventListener("click", loadProvisioning);
 els.channelForm.addEventListener("submit", sendChannelInput);

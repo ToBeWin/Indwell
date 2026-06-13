@@ -92,6 +92,7 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 - Agent run audit: trigger, retrieved memories, written memories, exposed tools, policy blocks, provider output summary.
 - Provider config: local JSON config with API key references, rejecting raw API keys in config.
 - Provider runtime: mock by default, plus OpenAI-compatible HTTP chat, structured tool calls, vision, ASR, TTS, and embedding paths for host/desktop.
+- Provider diagnostics: protected host-sim API and PWA buttons test LLM/Vision/ASR/TTS/Embedding slots independently.
 - Local secrets: host simulator seals local API secrets for an API key ref without returning the raw value.
 - Session auth: protected host-sim routes require a signed paired-device session token; the PWA can generate a browser Ed25519 keypair, complete signed pairing, and issue a session.
 - Confirmation grants: high-risk tools require a valid session plus a scoped, single-use passphrase grant.
@@ -110,7 +111,7 @@ Provider config stores `api_key_ref`, not raw API keys. In the host simulator, e
 export INDWELL_SECRET_KEY_LLM_MAIN="..."
 ```
 
-Then set provider kind to `openai_compatible`, base URL to a compatible `/v1` endpoint, and model to the target model name. Vision, ASR, TTS, and Embedding providers can be disabled, set to `mock`, inherit LLM connection details with `same_as_llm`, or use their own OpenAI-compatible connection.
+Then set provider kind to `openai_compatible`, base URL to a compatible `/v1` endpoint, and model to the target model name. Vision, ASR, TTS, and Embedding providers can be disabled, set to `mock`, inherit LLM connection details with `same_as_llm`, or use their own OpenAI-compatible connection. After pairing the PWA, use the provider test buttons or `POST /v1/providers/test` to validate each provider slot without running a full Agent turn.
 
 ## Protected API Auth
 

@@ -34,9 +34,10 @@ use indwell_protocol::{
     ProvisioningResponse,
 };
 use indwell_provider::{
-    AsrProvider, AudioBlob, ChatMessage, ChatRequest, LlmProvider, MockAsrProvider,
-    MockLlmProvider, MockTtsProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall,
-    ToolSpec, Transcript, TtsProvider, VoiceProfile,
+    AsrProvider, AudioBlob, ChatMessage, ChatRequest, EmbeddingProvider, LlmProvider,
+    MockAsrProvider, MockEmbeddingProvider, MockLlmProvider, MockTtsProvider, MockVisionProvider,
+    OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall, ToolSpec, Transcript, TtsProvider,
+    VisionProvider, VisionRequest, VoiceProfile,
 };
 use indwell_reflection::{ReflectionBudget, ReflectionEngine, ReflectionReport};
 use indwell_runs::{JsonlRunStore, RunStore};
@@ -304,6 +305,7 @@ fn build_router(state: AppState) -> Router {
             get(get_provisioning).post(save_provisioning),
         )
         .route("/v1/providers", get(get_providers).put(save_providers))
+        .route("/v1/providers/test", post(test_provider))
         .route(
             "/v1/secrets/:key_ref",
             get(get_secret).put(put_secret).delete(delete_secret),
@@ -827,6 +829,52 @@ async fn synthesize_with_config(
     }
 }
 
+async fn analyze_image_with_config(
+    state: &AppState,
+    providers: &ProviderConfigSet,
+    req: VisionRequest,
+) -> Result<indwell_provider::VisionResponse, AppError> {
+    let Some(config) = providers.vision.as_ref() else {
+        return Ok(MockVisionProvider.analyze_image(req).await?);
+    };
+    match config.kind.as_str() {
+        "mock" => Ok(MockVisionProvider.analyze_image(req).await?),
+        "same_as_llm" | "openai_compatible" => {
+            let resolved = provider_config_with_llm_fallback(config, &providers.llm);
+            let api_key = match resolved.api_key_ref.as_deref() {
+                Some(key_ref) => resolve_api_key(state, key_ref).await?,
+                None => None,
+            };
+            let provider = openai_provider_from_config(&resolved, api_key);
+            Ok(provider.analyze_image(req).await?)
+        }
+        other => Err(AppError::UnsupportedProviderKind(other.to_string())),
+    }
+}
+
+async fn embed_with_config(
+    state: &AppState,
+    providers: &ProviderConfigSet,
+    input: &str,
+) -> Result<Vec<f32>, AppError> {
+    let Some(config) = providers.embedding.as_ref() else {
+        return Ok(MockEmbeddingProvider.embed(input).await?);
+    };
+    match config.kind.as_str() {
+        "mock" => Ok(MockEmbeddingProvider.embed(input).await?),
+        "same_as_llm" | "openai_compatible" => {
+            let resolved = provider_config_with_llm_fallback(config, &providers.llm);
+            let api_key = match resolved.api_key_ref.as_deref() {
+                Some(key_ref) => resolve_api_key(state, key_ref).await?,
+                None => None,
+            };
+            let provider = openai_provider_from_config(&resolved, api_key);
+            Ok(provider.embed(input).await?)
+        }
+        other => Err(AppError::UnsupportedProviderKind(other.to_string())),
+    }
+}
+
 fn provider_config_with_llm_fallback(
     config: &ProviderConfig,
     llm: &ProviderConfig,
@@ -1045,6 +1093,202 @@ async fn save_providers(
 ) -> Result<Json<ApiEnvelope<ProviderConfigSet>>, AppError> {
     state.providers.lock().await.save(&config)?;
     Ok(Json(ApiEnvelope::ok(config)))
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderTestTarget {
+    Llm,
+    Vision,
+    Asr,
+    Tts,
+    Embedding,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderTestRequest {
+    target: ProviderTestTarget,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderTestResponse {
+    target: ProviderTestTarget,
+    provider: Option<ProviderConfig>,
+    ok: bool,
+    summary: String,
+    details: Value,
+}
+
+async fn test_provider(
+    State(state): State<AppState>,
+    Json(req): Json<ProviderTestRequest>,
+) -> Result<Json<ApiEnvelope<ProviderTestResponse>>, AppError> {
+    let providers = state.providers.lock().await.load()?;
+    let response = match req.target {
+        ProviderTestTarget::Llm => test_llm_provider(&state, &providers).await,
+        ProviderTestTarget::Vision => test_vision_provider(&state, &providers).await,
+        ProviderTestTarget::Asr => test_asr_provider(&state, &providers).await,
+        ProviderTestTarget::Tts => test_tts_provider(&state, &providers).await,
+        ProviderTestTarget::Embedding => test_embedding_provider(&state, &providers).await,
+    };
+    Ok(Json(ApiEnvelope::ok(response)))
+}
+
+async fn test_llm_provider(
+    state: &AppState,
+    providers: &ProviderConfigSet,
+) -> ProviderTestResponse {
+    let api_key = match providers.llm.api_key_ref.as_deref() {
+        Some(key_ref) => match resolve_api_key(state, key_ref).await {
+            Ok(api_key) => api_key,
+            Err(error) => {
+                return provider_test_failure(
+                    ProviderTestTarget::Llm,
+                    Some(providers.llm.clone()),
+                    error,
+                );
+            }
+        },
+        None => None,
+    };
+    let request = ChatRequest {
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Reply with a short Indwell provider diagnostic acknowledgement.".to_string(),
+        }],
+        tools: Vec::new(),
+    };
+
+    match chat_with_config(providers, api_key, request).await {
+        Ok(response) => ProviderTestResponse {
+            target: ProviderTestTarget::Llm,
+            provider: Some(providers.llm.clone()),
+            ok: true,
+            summary: "LLM provider responded".to_string(),
+            details: json!({
+                "text": response.text,
+                "tool_call_count": response.tool_calls.len(),
+            }),
+        },
+        Err(error) => {
+            provider_test_failure(ProviderTestTarget::Llm, Some(providers.llm.clone()), error)
+        }
+    }
+}
+
+async fn test_vision_provider(
+    state: &AppState,
+    providers: &ProviderConfigSet,
+) -> ProviderTestResponse {
+    let request = VisionRequest {
+        image_bytes: vec![0xff, 0xd8, 0xff, 0xd9],
+        mime_type: "image/jpeg".to_string(),
+        prompt: Some("Indwell provider diagnostic image.".to_string()),
+    };
+
+    match analyze_image_with_config(state, providers, request).await {
+        Ok(response) => ProviderTestResponse {
+            target: ProviderTestTarget::Vision,
+            provider: providers.vision.clone(),
+            ok: true,
+            summary: "Vision provider responded".to_string(),
+            details: json!({
+                "description": response.description,
+            }),
+        },
+        Err(error) => {
+            provider_test_failure(ProviderTestTarget::Vision, providers.vision.clone(), error)
+        }
+    }
+}
+
+async fn test_asr_provider(
+    state: &AppState,
+    providers: &ProviderConfigSet,
+) -> ProviderTestResponse {
+    let audio = AudioBlob {
+        bytes: b"indwell provider diagnostic".to_vec(),
+        mime_type: "audio/mock-text".to_string(),
+        duration_ms: Some(600),
+    };
+
+    match transcribe_with_config(state, providers, audio).await {
+        Ok(transcript) => ProviderTestResponse {
+            target: ProviderTestTarget::Asr,
+            provider: providers.asr.clone(),
+            ok: true,
+            summary: "ASR provider responded".to_string(),
+            details: json!({
+                "text": transcript.text,
+                "language": transcript.language,
+            }),
+        },
+        Err(error) => provider_test_failure(ProviderTestTarget::Asr, providers.asr.clone(), error),
+    }
+}
+
+async fn test_tts_provider(
+    state: &AppState,
+    providers: &ProviderConfigSet,
+) -> ProviderTestResponse {
+    let voice = VoiceProfile {
+        voice: "warm_indwell".to_string(),
+        language: Some("en".to_string()),
+    };
+
+    match synthesize_with_config(state, providers, "Indwell provider diagnostic.", voice).await {
+        Ok(audio) => ProviderTestResponse {
+            target: ProviderTestTarget::Tts,
+            provider: providers.tts.clone(),
+            ok: true,
+            summary: "TTS provider responded".to_string(),
+            details: json!({
+                "byte_len": audio.bytes.len(),
+                "mime_type": audio.mime_type,
+                "duration_ms": audio.duration_ms,
+            }),
+        },
+        Err(error) => provider_test_failure(ProviderTestTarget::Tts, providers.tts.clone(), error),
+    }
+}
+
+async fn test_embedding_provider(
+    state: &AppState,
+    providers: &ProviderConfigSet,
+) -> ProviderTestResponse {
+    match embed_with_config(state, providers, "Indwell provider diagnostic.").await {
+        Ok(vector) => ProviderTestResponse {
+            target: ProviderTestTarget::Embedding,
+            provider: providers.embedding.clone(),
+            ok: true,
+            summary: "Embedding provider responded".to_string(),
+            details: json!({
+                "dimensions": vector.len(),
+                "preview": vector.iter().take(4).copied().collect::<Vec<_>>(),
+            }),
+        },
+        Err(error) => provider_test_failure(
+            ProviderTestTarget::Embedding,
+            providers.embedding.clone(),
+            error,
+        ),
+    }
+}
+
+fn provider_test_failure(
+    target: ProviderTestTarget,
+    provider: Option<ProviderConfig>,
+    error: impl std::fmt::Debug,
+) -> ProviderTestResponse {
+    ProviderTestResponse {
+        target,
+        provider,
+        ok: false,
+        summary: "Provider diagnostic failed".to_string(),
+        details: json!({
+            "error": format!("{error:?}"),
+        }),
+    }
 }
 
 async fn put_secret(
@@ -1933,6 +2177,102 @@ mod tests {
         assert_eq!(resolved.model, "whisper-compatible");
     }
 
+    #[tokio::test]
+    async fn provider_diagnostics_require_session() {
+        let root = temp_root("provider-diagnostics-auth");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/providers/test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "target": "llm" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn provider_diagnostics_cover_mock_provider_slots() {
+        let root = temp_root("provider-diagnostics-mock");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        state
+            .providers
+            .lock()
+            .await
+            .save(&mock_all_provider_config())
+            .unwrap();
+        let token = issue_test_session(&state).await;
+        let app = build_router(state);
+
+        for target in ["llm", "vision", "asr", "tts", "embedding"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/providers/test")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::from(json!({ "target": target }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let data = response_data(response).await;
+            assert_eq!(data["target"], target);
+            assert_eq!(data["ok"], true);
+            assert!(data["summary"].as_str().unwrap().contains("responded"));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn provider_diagnostics_return_structured_failures() {
+        let root = temp_root("provider-diagnostics-failure");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let mut config = external_provider_config();
+        config.llm.api_key_ref = Some("missing_provider_diagnostic_key".to_string());
+        state.providers.lock().await.save(&config).unwrap();
+        let token = issue_test_session(&state).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/providers/test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(json!({ "target": "llm" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = response_data(response).await;
+        assert_eq!(data["target"], "llm");
+        assert_eq!(data["ok"], false);
+        assert!(data["details"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("MissingApiKey"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn pairing_key_inputs_accept_hex_or_utf8_for_host_sim() {
         assert_eq!(decode_hex_or_utf8("01020a").unwrap(), vec![1, 2, 10]);
@@ -2429,6 +2769,50 @@ mod tests {
             tts: None,
             embedding: None,
         }
+    }
+
+    fn mock_all_provider_config() -> ProviderConfigSet {
+        ProviderConfigSet {
+            llm: ProviderConfig {
+                kind: "mock".to_string(),
+                base_url: None,
+                api_key_ref: None,
+                model: "mock:phase0".to_string(),
+                max_input_tokens: Some(4000),
+                max_output_tokens: Some(600),
+            },
+            vision: Some(mock_optional_provider("mock:vision")),
+            asr: Some(mock_optional_provider("mock:asr")),
+            tts: Some(mock_optional_provider("mock:tts")),
+            embedding: Some(mock_optional_provider("mock:embedding")),
+        }
+    }
+
+    fn mock_optional_provider(model: &str) -> ProviderConfig {
+        ProviderConfig {
+            kind: "mock".to_string(),
+            base_url: None,
+            api_key_ref: None,
+            model: model.to_string(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+        }
+    }
+
+    async fn issue_test_session(state: &super::AppState) -> String {
+        let device = test_paired_device();
+        let (_session, token) = state
+            .sessions
+            .lock()
+            .await
+            .issue(
+                &device,
+                "owner",
+                chrono::Utc::now().timestamp_millis() as u64,
+                60_000,
+            )
+            .unwrap();
+        token
     }
 
     fn test_paired_device() -> PairedDevice {

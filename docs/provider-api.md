@@ -29,4 +29,32 @@ providers may be disabled, set to `mock`, set to `same_as_llm` to inherit the
 LLM base URL and key ref, or configured as independent `openai_compatible`
 providers.
 
+Host-sim exposes a protected diagnostics endpoint:
+
+```http
+POST /v1/providers/test
+Authorization: Bearer <session-token>
+Content-Type: application/json
+
+{ "target": "llm" }
+```
+
+Supported targets are `llm`, `vision`, `asr`, `tts`, and `embedding`. The
+response is always a structured diagnostic envelope for configuration/provider
+failures:
+
+```json
+{
+  "target": "llm",
+  "ok": false,
+  "summary": "Provider diagnostic failed",
+  "details": {
+    "error": "Provider(MissingApiKey { api_key_ref: \"key_llm_main\" })"
+  }
+}
+```
+
+This lets the PWA, local gateway, or future mobile app validate provider slots
+without running a full Agent conversation.
+
 Firmware should call providers directly through ESP-IDF HTTP/TLS clients or delegate heavier speech/vision providers to the paired phone/local gateway, without any project-owned proxy.
