@@ -1362,7 +1362,10 @@ async function executeOwnerCameraTool() {
   await executeTool(
     "device.camera.capture",
     "local_pwa",
-    {},
+    {
+      analyze: true,
+      prompt: "Describe what the Indwell host simulator camera captured.",
+    },
     els.toolCameraOwnerButton,
   );
 }

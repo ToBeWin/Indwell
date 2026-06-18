@@ -39,3 +39,7 @@ The console defaults to the host simulator at `http://127.0.0.1:3030`.
 - `POST /v1/ota/check`
 - `GET /v1/runs`
 - `GET /v1/runs/:id`
+
+The `Owner camera` button executes `device.camera.capture` with
+`analyze: true`, so the host simulator sends a simulated JPEG fixture through
+the configured Vision provider and shows the analysis in the tool output.

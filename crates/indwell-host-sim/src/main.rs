@@ -1046,6 +1046,13 @@ fn push_unique_tag(tags: &mut Vec<String>, tag: &str) {
     }
 }
 
+fn host_sim_camera_jpeg() -> &'static [u8] {
+    // Minimal JPEG-like fixture: enough for provider request plumbing without storing media.
+    &[
+        0xff, 0xd8, 0xff, 0xe0, b'I', b'N', b'D', b'W', b'E', b'L', b'L', 0xff, 0xd9,
+    ]
+}
+
 fn decode_hex_or_utf8(value: &str) -> Result<Vec<u8>, AppError> {
     let trimmed = value.trim();
     if trimmed.len() % 2 == 0 && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1866,18 +1873,55 @@ async fn execute_mock_tool(
                 summary: "simulated speaker output".to_string(),
             })
         }
-        "device.camera.capture" => Ok(ToolExecution {
-            output: json!({
+        "device.camera.capture" => {
+            let analyze = input
+                .get("analyze")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let prompt = input
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("Describe the captured scene for the Indwell user.")
+                .to_string();
+            let mut output = json!({
                 "accepted": true,
                 "simulated": true,
                 "path": "data/host-sim/camera/latest.jpg",
                 "width": 640,
                 "height": 480,
+                "mime_type": "image/jpeg",
+                "byte_len": host_sim_camera_jpeg().len(),
                 "retention": "temporary",
-            }),
-            memory_id: None,
-            summary: "simulated still image capture".to_string(),
-        }),
+                "analyzed": analyze,
+            });
+            let mut summary = "simulated still image capture".to_string();
+            if analyze {
+                let providers = state.providers.lock().await.load()?;
+                let vision = analyze_image_with_config(
+                    state,
+                    &providers,
+                    VisionRequest {
+                        image_bytes: host_sim_camera_jpeg().to_vec(),
+                        mime_type: "image/jpeg".to_string(),
+                        prompt: Some(prompt),
+                    },
+                )
+                .await?;
+                output["vision"] = json!({
+                    "description": vision.description,
+                    "provider": providers.vision.as_ref().map(|provider| json!({
+                        "kind": provider.kind,
+                        "model": provider.model,
+                    })),
+                });
+                summary = "captured still image and analyzed it with vision provider".to_string();
+            }
+            Ok(ToolExecution {
+                output,
+                memory_id: None,
+                summary,
+            })
+        }
         "device.sensor.read" => {
             let sensor = input
                 .get("sensor")
@@ -2100,6 +2144,13 @@ fn tool_input_schema(tool: &str) -> Value {
             "properties": { "id": { "type": "string" } },
             "required": ["id"],
         }),
+        "device.camera.capture" => json!({
+            "type": "object",
+            "properties": {
+                "analyze": { "type": "boolean" },
+                "prompt": { "type": "string" }
+            },
+        }),
         "device.sensor.read" => json!({
             "type": "object",
             "properties": { "sensor": { "type": "string" } },
@@ -2134,7 +2185,11 @@ fn tool_output_schema(tool: &str) -> Value {
                 "path": { "type": "string" },
                 "width": { "type": "integer" },
                 "height": { "type": "integer" },
-                "retention": { "type": "string" }
+                "mime_type": { "type": "string" },
+                "byte_len": { "type": "integer" },
+                "retention": { "type": "string" },
+                "analyzed": { "type": "boolean" },
+                "vision": { "type": ["object", "null"] }
             }
         }),
         "device.sensor.read" => json!({
@@ -2783,6 +2838,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn camera_capture_can_analyze_with_vision_provider() {
+        let root = temp_root("camera-vision-tool");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        state
+            .providers
+            .lock()
+            .await
+            .save(&mock_all_provider_config())
+            .unwrap();
+
+        let execution = execute_mock_tool(
+            &state,
+            "device.camera.capture",
+            json!({
+                "analyze": true,
+                "prompt": "Describe the host simulator camera fixture."
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.output["accepted"], true);
+        assert_eq!(execution.output["analyzed"], true);
+        assert!(execution.output["vision"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Mock vision saw"));
+        assert_eq!(execution.output["vision"]["provider"]["kind"], "mock");
+        assert!(execution.summary.contains("vision provider"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn inbox_memory_can_be_audited_and_accepted() {
         let root = temp_root("memory-inbox-review");
         let _ = std::fs::remove_dir_all(&root);
@@ -2942,6 +3031,58 @@ mod tests {
         assert!(records
             .iter()
             .all(|record| !record.tags.iter().any(|tag| tag == "unverified_ingress")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn owner_look_request_runs_camera_vision_and_audits_tool_call() {
+        let root = temp_root("owner-look-camera-vision");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        state
+            .providers
+            .lock()
+            .await
+            .save(&mock_all_provider_config())
+            .unwrap();
+        let token = issue_test_session(&state).await;
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/channel/input")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "session_id": "owner-look-test",
+                            "subject_hint": "owner",
+                            "text": "看看桌面上有什么",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = response_data(response).await;
+        let run_id = data["run_id"].as_str().unwrap();
+        let run = state
+            .runs
+            .lock()
+            .await
+            .get(uuid::Uuid::parse_str(run_id).unwrap())
+            .unwrap()
+            .expect("run should be stored");
+        assert!(run.audit.tool_calls.iter().any(|call| {
+            call.tool == "device.camera.capture"
+                && call.summary.contains("analyzed it with vision provider")
+        }));
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -62,7 +62,10 @@ pub fn plan_tool_calls(text: &str, allowed_tools: &[ToolDescriptor]) -> Vec<Plan
     {
         plans.push(PlannedToolCall {
             tool: "device.camera.capture".to_string(),
-            input: json!({}),
+            input: json!({
+                "analyze": wants_vision_analysis(&lowered),
+                "prompt": "Describe the captured scene for the Indwell user."
+            }),
         });
     }
 
@@ -167,6 +170,24 @@ fn has_explicit_led_control_intent(text: &str) -> bool {
     )
 }
 
+fn wants_vision_analysis(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "see",
+            "look",
+            "what is",
+            "what's",
+            "describe",
+            "看到",
+            "看看",
+            "看见",
+            "描述",
+            "这是什么",
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use indwell_core::{RiskLevel, ToolDescriptor};
@@ -224,6 +245,16 @@ mod tests {
 
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].tool, "device.camera.capture");
+        assert_eq!(plans[0].input["analyze"], false);
+    }
+
+    #[test]
+    fn plans_camera_with_vision_analysis_for_look_command() {
+        let plans = plan_tool_calls("看看桌面上有什么", &tools(&["device.camera.capture"]));
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].tool, "device.camera.capture");
+        assert_eq!(plans[0].input["analyze"], true);
     }
 
     #[test]

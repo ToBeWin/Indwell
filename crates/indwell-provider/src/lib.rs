@@ -713,7 +713,12 @@ fn mock_tool_calls_from_text(text: &str) -> Vec<ToolCall> {
         return vec![ToolCall {
             id: "mock-camera-capture".to_string(),
             name: "device.camera.capture".to_string(),
-            arguments: serde_json::json!({}),
+            arguments: serde_json::json!({
+                "analyze": normalized.contains("see")
+                    || normalized.contains("look")
+                    || normalized.contains("看看"),
+                "prompt": "Describe the captured scene for the Indwell user."
+            }),
         }];
     }
 
@@ -1098,6 +1103,24 @@ mod tests {
 
         let embedding = MockEmbeddingProvider;
         assert_eq!(embedding.embed("memory").await.unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn mock_llm_requests_vision_analysis_for_look_intent() {
+        let response = MockLlmProvider
+            .chat(ChatRequest {
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "看看桌面上有什么".to_string(),
+                }],
+                tools: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "device.camera.capture");
+        assert_eq!(response.tool_calls[0].arguments["analyze"], true);
     }
 
     #[tokio::test]

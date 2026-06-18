@@ -19,6 +19,12 @@ those calls through the local tool runtime and records the result in the
 AgentRun audit trail. The older keyword planner remains as a mock fallback when
 the provider returns plain text only.
 
+`device.camera.capture` can request Vision Provider analysis with
+`{"analyze": true, "prompt": "..."}`. Host-sim uses a tiny simulated JPEG
+fixture, sends it through the configured Vision provider, returns the
+description in the tool output, and records the completed camera tool call in
+the AgentRun audit trail.
+
 Provider config uses `api_key_ref`. In host simulator, the ref can be resolved from:
 
 - PWA secret storage endpoint for the current process
