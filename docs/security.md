@@ -39,6 +39,10 @@ Public bootstrap routes:
 - `POST /v1/auth/passphrase/verify`
 - channel input and webhook routes for low-trust ingress testing
 
+The PWA confirmation panel lets a local owner bind a passphrase grant to an
+exact tool name. OTA Apply uses `system.update.apply`; the tool executor rejects
+the apply request until a matching, unexpired, single-use grant is supplied.
+
 Low-trust ingress routes are not allowed to spend user-owned model API keys.
 When the stored provider config points to a non-mock provider and the request
 does not carry a valid paired-device session, host-sim falls back to mock

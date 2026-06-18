@@ -2057,19 +2057,34 @@ async fn execute_mock_tool(
         }),
         "system.update.apply" => {
             let manifest = state.ota.lock().await.load()?;
-            let plan =
-                indwell_ota::plan_ota_apply(&manifest, "host-sim", "0.1.0-host-sim", OtaSlot::Ota0)
-                    .map_err(AppError::OtaCore)?;
-            Ok(ToolExecution {
-                output: json!({
-                    "accepted": true,
-                    "simulated": true,
-                    "plan": plan,
-                    "next_state": "updating",
+            match indwell_ota::plan_ota_apply(
+                &manifest,
+                "host-sim",
+                "0.1.0-host-sim",
+                OtaSlot::Ota0,
+            ) {
+                Ok(plan) => Ok(ToolExecution {
+                    output: json!({
+                        "accepted": true,
+                        "simulated": true,
+                        "plan": plan,
+                        "next_state": "updating",
+                    }),
+                    memory_id: None,
+                    summary: "simulated verified OTA apply plan".to_string(),
                 }),
-                memory_id: None,
-                summary: "simulated verified OTA apply plan".to_string(),
-            })
+                Err(error) => Ok(ToolExecution {
+                    output: json!({
+                        "accepted": false,
+                        "simulated": true,
+                        "reason": error.to_string(),
+                        "manifest": manifest,
+                        "next_state": "idle",
+                    }),
+                    memory_id: None,
+                    summary: format!("OTA apply refused: {error}"),
+                }),
+            }
         }
         _ => Ok(ToolExecution {
             output: json!({
@@ -2210,7 +2225,6 @@ enum AppError {
     Provider(indwell_provider::ProviderError),
     ProviderConfig(provider_config::ProviderConfigStoreError),
     Ota(ota::OtaManifestStoreError),
-    OtaCore(indwell_ota::OtaError),
     RunStore(indwell_runs::RunStoreError),
     Security(indwell_security::SecurityError),
     Reflection(indwell_reflection::ReflectionError),
@@ -2284,7 +2298,6 @@ impl IntoResponse for AppError {
             Self::Provider(err) => err.to_string(),
             Self::ProviderConfig(err) => err.to_string(),
             Self::Ota(err) => err.to_string(),
-            Self::OtaCore(err) => err.to_string(),
             Self::RunStore(err) => err.to_string(),
             Self::Security(err) => err.to_string(),
             Self::Reflection(err) => err.to_string(),
@@ -2868,6 +2881,88 @@ mod tests {
             .contains("Mock vision saw"));
         assert_eq!(execution.output["vision"]["provider"]["kind"], "mock");
         assert!(execution.summary.contains("vision provider"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ota_apply_requires_confirmation_and_returns_structured_result() {
+        let root = temp_root("ota-apply-confirmation");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let token = issue_test_session(&state).await;
+        let app = build_router(state.clone());
+
+        let blocked_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/system.update.apply/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "session_token": token,
+                            "input": {}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked_response.status(), StatusCode::OK);
+        let blocked = response_data(blocked_response).await;
+        assert_eq!(blocked["decision"], "require_confirmation");
+
+        let grant = state.grants.lock().await.issue(
+            "owner",
+            "system.update.apply",
+            chrono::Utc::now().timestamp_millis() as u64,
+            60_000,
+        );
+        let token = issue_test_session(&state).await;
+        let applied_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/system.update.apply/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "session_token": token,
+                            "confirmation_grant_id": grant.grant_id,
+                            "input": {}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(applied_response.status(), StatusCode::OK);
+        let applied = response_data(applied_response).await;
+        assert_eq!(applied["decision"], "allow");
+        assert_eq!(applied["output"]["accepted"], false);
+        assert!(applied["output"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("already installed"));
+        let run_id = applied["run_id"].as_str().unwrap();
+        let run = state
+            .runs
+            .lock()
+            .await
+            .get(uuid::Uuid::parse_str(run_id).unwrap())
+            .unwrap()
+            .expect("run should be stored");
+        assert!(run.audit.tool_calls.iter().any(|call| {
+            call.tool == "system.update.apply" && call.summary.contains("OTA apply refused")
+        }));
         let _ = std::fs::remove_dir_all(root);
     }
 

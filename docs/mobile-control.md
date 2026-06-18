@@ -17,6 +17,7 @@ Implemented in host simulator:
 - mobile command normalization for command-style events
 - run audit for every channel input
 - owner-authenticated camera capture can request Vision Provider analysis
+- OTA Apply checks for a scoped `system.update.apply` confirmation grant before executing
 - public ingress quarantine for unauthenticated channel memory
 - mock-provider fallback for unauthenticated ingress when real providers are configured
 

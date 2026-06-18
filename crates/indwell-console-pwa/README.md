@@ -40,6 +40,10 @@ The console defaults to the host simulator at `http://127.0.0.1:3030`.
 - `GET /v1/runs`
 - `GET /v1/runs/:id`
 
+The `Apply update` button requires a matching `system.update.apply`
+confirmation grant. If no grant is present, the console issues a dynamic
+passphrase challenge and asks the owner to verify it before retrying the apply.
+
 The `Owner camera` button executes `device.camera.capture` with
 `analyze: true`, so the host simulator sends a simulated JPEG fixture through
 the configured Vision provider and shows the analysis in the tool output.

@@ -95,10 +95,10 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 - Provider diagnostics: protected host-sim API and PWA buttons test LLM/Vision/ASR/TTS/Embedding slots independently.
 - Local secrets: host simulator seals local API secrets for an API key ref without returning the raw value.
 - Session auth: protected host-sim routes require a signed paired-device session token; the PWA can generate a browser Ed25519 keypair, complete signed pairing, and issue a session.
-- Confirmation grants: high-risk tools require a valid session plus a scoped, single-use passphrase grant.
+- Confirmation grants: high-risk tools require a valid session plus a scoped, single-use passphrase grant; PWA OTA Apply uses this path.
 - Tool runtime: provider-returned structured tool calls, planner fallback, status, LED, speaker, camera capture with optional Vision Provider analysis, sensor read mock, memory search/write/delete, identity, confirmation, OTA check.
-- OTA: local manifest store, shape checks, HTTPS URL check, SHA-256 format check, Ed25519 manifest signature verification, apply plan, slot alternation.
-- Console PWA: LLM/Vision/ASR/TTS/Embedding provider config, channel input, custom webhook, memory add/search/delete/inbox review/export/JSON inspection, tool catalog/runtime, OTA manifest/check, run audit, raw API log.
+- OTA: local manifest store, shape checks, HTTPS URL check, SHA-256 format check, Ed25519 manifest signature verification, apply plan, slot alternation, and confirmed apply UX.
+- Console PWA: LLM/Vision/ASR/TTS/Embedding provider config, channel input, custom webhook, memory add/search/delete/inbox review/export/JSON inspection, tool catalog/runtime, OTA manifest/check/apply, run audit, raw API log.
 - Firmware scaffold: ESP32-S3 boot plan, HAL boundary, partition table, and sdkconfig defaults.
 - ESP-IDF driver map: Proto v1 peripheral bindings to HAL traits.
 - Protocol provisioning schema: Wi-Fi password references and provider config without raw secrets.

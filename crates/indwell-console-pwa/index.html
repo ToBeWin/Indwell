@@ -361,6 +361,8 @@
             <input id="passphraseChallengeId" name="passphraseChallengeId" type="text" autocomplete="off">
             <label for="passphraseSpoken">Spoken phrase</label>
             <input id="passphraseSpoken" name="passphraseSpoken" type="text" autocomplete="off">
+            <label for="passphraseAllowedTool">Allowed tool</label>
+            <input id="passphraseAllowedTool" name="passphraseAllowedTool" type="text" value="system.update.apply" autocomplete="off">
             <button type="submit">Verify phrase</button>
           </form>
           <div id="passphraseResult" class="result-box empty">No passphrase challenge started yet.</div>
@@ -396,6 +398,7 @@
           <div class="button-row">
             <button id="loadOtaButton" type="button">Load manifest</button>
             <button id="checkOtaButton" class="secondary" type="button">Verify manifest</button>
+            <button id="applyOtaButton" class="secondary danger" type="button">Apply update</button>
             <button id="toolUpdateButton" class="secondary" type="button">Run update check</button>
           </div>
           <div id="otaResult" class="result-box empty">No OTA manifest loaded yet.</div>

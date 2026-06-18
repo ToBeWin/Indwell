@@ -89,6 +89,7 @@ const els = {
   passphraseForm: document.querySelector("#passphraseForm"),
   passphraseChallengeId: document.querySelector("#passphraseChallengeId"),
   passphraseSpoken: document.querySelector("#passphraseSpoken"),
+  passphraseAllowedTool: document.querySelector("#passphraseAllowedTool"),
   passphraseResult: document.querySelector("#passphraseResult"),
   loadToolsButton: document.querySelector("#loadToolsButton"),
   toolCheckButton: document.querySelector("#toolCheckButton"),
@@ -101,6 +102,7 @@ const els = {
   toolResult: document.querySelector("#toolResult"),
   loadOtaButton: document.querySelector("#loadOtaButton"),
   checkOtaButton: document.querySelector("#checkOtaButton"),
+  applyOtaButton: document.querySelector("#applyOtaButton"),
   toolUpdateButton: document.querySelector("#toolUpdateButton"),
   otaResult: document.querySelector("#otaResult"),
   webhookForm: document.querySelector("#webhookForm"),
@@ -1216,7 +1218,7 @@ async function verifyPassphraseChallenge(event) {
         challenge_id: els.passphraseChallengeId.value.trim(),
         spoken_phrase: els.passphraseSpoken.value.trim(),
         subject_id: "owner",
-        allowed_tool: "system.update.apply",
+        allowed_tool: els.passphraseAllowedTool.value.trim() || "system.update.apply",
       },
     });
     lastConfirmationGrant = result.grant;
@@ -1318,19 +1320,23 @@ async function executeTool(tool, channel, input, button, options = {}) {
 
   try {
     const sessionToken = window.localStorage.getItem(STORAGE_SESSION_TOKEN);
+    const confirmationGrantId =
+      lastConfirmationGrant && lastConfirmationGrant.allowed_tool === tool
+        ? lastConfirmationGrant.grant_id
+        : null;
     const data = await requestJson(`/v1/tools/${encodeURIComponent(tool)}/execute`, {
       method: "POST",
       body: {
         channel,
         subject_id: channel === "local_pwa" ? "owner" : null,
         session_token: sessionToken || null,
-        confirmation_grant_id:
-          lastConfirmationGrant && lastConfirmationGrant.allowed_tool === tool
-            ? lastConfirmationGrant.grant_id
-            : null,
+        confirmation_grant_id: confirmationGrantId,
         input,
       },
     });
+    if (confirmationGrantId) {
+      lastConfirmationGrant = null;
+    }
 
     if (options.render !== false) {
       renderToolExecution(data);
@@ -1435,6 +1441,54 @@ async function checkOtaManifest() {
     renderError(els.otaResult, error);
   } finally {
     setBusy(els.checkOtaButton, false);
+  }
+}
+
+function hasConfirmationGrantFor(tool) {
+  return Boolean(
+    lastConfirmationGrant &&
+      lastConfirmationGrant.allowed_tool === tool &&
+      Number(lastConfirmationGrant.expires_at_ms || 0) > Date.now(),
+  );
+}
+
+async function applyOtaUpdate() {
+  const tool = "system.update.apply";
+  if (!requireSessionFor(els.otaResult, "OTA apply")) {
+    return;
+  }
+
+  if (!hasConfirmationGrantFor(tool)) {
+    els.passphraseAllowedTool.value = tool;
+    await issuePassphraseChallenge();
+    els.otaResult.classList.remove("empty");
+    els.otaResult.innerHTML = `
+      <strong>Confirmation required</strong>
+      <p>Verify the dynamic passphrase for <code>${escapeHtml(tool)}</code>, then press Apply update again.</p>
+    `;
+    return;
+  }
+
+  setBusy(els.applyOtaButton, true);
+  try {
+    const data = await executeTool(tool, "local_pwa", {}, els.applyOtaButton, { render: false });
+    const decision = describePolicyDecision(data.decision);
+    els.otaResult.classList.remove("empty");
+    els.otaResult.innerHTML = `
+      <strong>OTA apply result</strong>
+      <dl class="kv">
+        <div><dt>Decision</dt><dd>${escapeHtml(decision.decision)}</dd></div>
+        <div><dt>Run ID</dt><dd>${escapeHtml(data.run_id || "none")}</dd></div>
+        <div><dt>Accepted</dt><dd>${escapeHtml(String(data.output?.accepted ?? false))}</dd></div>
+        <div><dt>Next state</dt><dd>${escapeHtml(data.output?.next_state || "none")}</dd></div>
+      </dl>
+      <pre class="json-preview">${escapeHtml(formatJson(data.output || data))}</pre>
+    `;
+    refreshRuns();
+  } catch (error) {
+    renderError(els.otaResult, error);
+  } finally {
+    setBusy(els.applyOtaButton, false);
   }
 }
 
@@ -1655,6 +1709,7 @@ els.toolWriteMemoryButton.addEventListener("click", executeWriteMemoryTool);
 els.toolBlockedCameraButton.addEventListener("click", executeBlockedCameraTool);
 els.loadOtaButton.addEventListener("click", loadOtaManifest);
 els.checkOtaButton.addEventListener("click", checkOtaManifest);
+els.applyOtaButton.addEventListener("click", applyOtaUpdate);
 els.toolUpdateButton.addEventListener("click", executeUpdateCheckTool);
 els.webhookForm.addEventListener("submit", sendWebhookInput);
 els.refreshRunsButton.addEventListener("click", refreshRuns);
