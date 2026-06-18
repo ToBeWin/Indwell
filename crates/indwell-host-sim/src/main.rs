@@ -2,6 +2,7 @@ mod context;
 mod ota;
 mod planner;
 mod provider_config;
+mod tools;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -14,14 +15,13 @@ use axum::{
     Extension, Json, Router,
 };
 use chrono::Utc;
-use context::{apply_context_pack, contextual_chat_request, tool_input_schema, ContextAssembler};
+use context::{apply_context_pack, contextual_chat_request, ContextAssembler};
 use indwell_channel::{
     BasicChannelAdapter, ChannelAdapter, ChannelEvent, ChannelInbound, ChannelKind, ChannelPolicy,
     ChannelPrincipal,
 };
 use indwell_core::{
-    default_tools, AgentRun, AuthContext, AuthMethod, DeviceState, Event, ProviderSelection,
-    RiskLevel, ToolAuditOutcome, ToolDescriptor,
+    AgentRun, AuthContext, AuthMethod, DeviceState, Event, ProviderSelection, ToolAuditOutcome,
 };
 use indwell_memory::{
     JsonlMemoryStore, MemoryExport, MemoryKind, MemoryMetabolismReport, MemoryQuery, MemoryRecord,
@@ -53,6 +53,7 @@ use provider_config::JsonProviderConfigStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
+use tools::{lookup_tool, tool_catalog, HostToolCatalogItem};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
 
@@ -138,7 +139,6 @@ struct ToolDecisionResponse {
 #[derive(Debug, Deserialize)]
 struct ToolExecuteRequest {
     channel: ChannelKind,
-    subject_id: Option<String>,
     session_token: Option<String>,
     confirmation_grant_id: Option<String>,
     input: Option<Value>,
@@ -227,18 +227,7 @@ struct ReflectionRunRequest {
 
 #[derive(Debug, Serialize)]
 struct ToolCatalogResponse {
-    tools: Vec<ToolCatalogItem>,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolCatalogItem {
-    name: String,
-    description: String,
-    risk: RiskLevel,
-    requires_owner: bool,
-    requires_confirmation: bool,
-    input_schema: Value,
-    output_schema: Value,
+    tools: Vec<HostToolCatalogItem>,
 }
 
 #[tokio::main]
@@ -753,6 +742,11 @@ fn command_prompt(command: &MobileCommand) -> String {
 async fn execute_planned_tool_calls(state: &AppState, run: &mut AgentRun, text: &str) {
     let planned_tools = plan_tool_calls(text, &run.allowed_tools);
     for planned in planned_tools {
+        if tool_requires_runtime_confirmation(run, &planned.tool) {
+            record_tool_confirmation_block(run, &planned.tool, "planned tool");
+            continue;
+        }
+
         match execute_mock_tool(state, &planned.tool, planned.input).await {
             Ok(execution) => {
                 run.record_tool_call(
@@ -787,6 +781,10 @@ async fn execute_provider_tool_calls(
             run.record_policy_block(summary);
             continue;
         }
+        if tool_requires_runtime_confirmation(run, &call.name) {
+            record_tool_confirmation_block(run, &call.name, "provider tool");
+            continue;
+        }
 
         match execute_mock_tool(state, &call.name, call.arguments).await {
             Ok(execution) => {
@@ -808,6 +806,21 @@ async fn execute_provider_tool_calls(
             }
         }
     }
+}
+
+fn tool_requires_runtime_confirmation(run: &AgentRun, tool_name: &str) -> bool {
+    run.allowed_tools
+        .iter()
+        .find(|tool| tool.name == tool_name)
+        .is_some_and(|tool| tool.requires_confirmation)
+}
+
+fn record_tool_confirmation_block(run: &mut AgentRun, tool_name: &str, source: &str) {
+    let summary = format!(
+        "{source} requested {tool_name}, but this high-risk tool requires explicit confirmation"
+    );
+    run.record_tool_call(tool_name, ToolAuditOutcome::Blocked, summary.clone());
+    run.record_policy_block(summary);
 }
 
 async fn chat_with_config(
@@ -1677,18 +1690,7 @@ async fn get_run(
 
 async fn list_tools() -> Json<ApiEnvelope<ToolCatalogResponse>> {
     Json(ApiEnvelope::ok(ToolCatalogResponse {
-        tools: default_tools()
-            .into_iter()
-            .map(|tool| ToolCatalogItem {
-                input_schema: tool_input_schema(&tool.name),
-                output_schema: tool_output_schema(&tool.name),
-                name: tool.name,
-                description: tool.description,
-                risk: tool.risk,
-                requires_owner: tool.requires_owner,
-                requires_confirmation: tool.requires_confirmation,
-            })
-            .collect(),
+        tools: tool_catalog(),
     }))
 }
 
@@ -1698,12 +1700,7 @@ async fn check_tool(
     Path(tool): Path<String>,
     Json(channel): Json<ChannelKind>,
 ) -> Json<ApiEnvelope<ToolDecisionResponse>> {
-    let descriptor = default_tools()
-        .into_iter()
-        .find(|candidate| candidate.name == tool)
-        .unwrap_or_else(|| {
-            ToolDescriptor::new(tool.clone(), "Unknown tool.", RiskLevel::Forbidden)
-        });
+    let descriptor = lookup_tool(&tool);
     let policy = ChannelPolicy::default_for(channel);
     let auth = AuthContext::owner(
         session.subject_id,
@@ -1716,15 +1713,11 @@ async fn check_tool(
 
 async fn execute_tool(
     State(state): State<AppState>,
+    Extension(session): Extension<AuthSession>,
     Path(tool): Path<String>,
     Json(req): Json<ToolExecuteRequest>,
 ) -> Result<Json<ApiEnvelope<ToolExecuteResponse>>, AppError> {
-    let descriptor = default_tools()
-        .into_iter()
-        .find(|candidate| candidate.name == tool)
-        .unwrap_or_else(|| {
-            ToolDescriptor::new(tool.clone(), "Unknown tool.", RiskLevel::Forbidden)
-        });
+    let descriptor = lookup_tool(&tool);
     let channel_policy = ChannelPolicy::default_for(req.channel);
     let auth = if let Some(token) = req.session_token.as_deref() {
         let session = state
@@ -1737,14 +1730,10 @@ async fn execute_tool(
             vec![indwell_core::AuthMethod::PairedDevice],
         )
     } else {
-        match req.subject_id {
-            Some(subject_id) => AuthContext {
-                subject_id: Some(subject_id),
-                owner_authenticated: false,
-                methods: vec![],
-            },
-            None => AuthContext::anonymous(),
-        }
+        AuthContext::owner(
+            session.subject_id,
+            vec![indwell_core::AuthMethod::PairedDevice],
+        )
     };
     let decision = state
         .policy
@@ -2152,50 +2141,6 @@ async fn channel_policies() -> Json<ApiEnvelope<ChannelPolicyResponse>> {
     }))
 }
 
-fn tool_output_schema(tool: &str) -> Value {
-    match tool {
-        "system.status" => json!({
-            "type": "object",
-            "properties": {
-                "state": { "type": "string" },
-                "network": { "type": "string" },
-                "provider": { "type": "object" },
-                "memory_backend": { "type": "string" }
-            }
-        }),
-        "system.update.check" => json!({
-            "type": "object",
-            "properties": {
-                "update_available": { "type": "boolean" },
-                "current_version": { "type": "string" },
-                "manifest": { "type": "object" },
-                "verification": { "type": "object" }
-            }
-        }),
-        "device.camera.capture" => json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "width": { "type": "integer" },
-                "height": { "type": "integer" },
-                "mime_type": { "type": "string" },
-                "byte_len": { "type": "integer" },
-                "retention": { "type": "string" },
-                "analyzed": { "type": "boolean" },
-                "vision": { "type": ["object", "null"] }
-            }
-        }),
-        "device.sensor.read" => json!({
-            "type": "object",
-            "properties": {
-                "sensor": { "type": "string" },
-                "value": { "type": "object" }
-            }
-        }),
-        _ => json!({ "type": "object" }),
-    }
-}
-
 #[derive(Debug)]
 enum AppError {
     Channel(indwell_channel::ChannelError),
@@ -2314,8 +2259,8 @@ mod tests {
 
     use super::{
         api_key_env_name, auth_context_for_inbound, build_router, command_prompt,
-        decode_hex_or_utf8, execute_mock_tool, init_state, provider_config_with_llm_fallback,
-        session_token_from_headers,
+        decode_hex_or_utf8, execute_mock_tool, execute_provider_tool_calls, init_state,
+        provider_config_with_llm_fallback, session_token_from_headers,
     };
 
     #[test]
@@ -2787,6 +2732,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_tool_call_cannot_bypass_high_risk_confirmation() {
+        let root = temp_root("provider-high-risk-block");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let mut run = indwell_core::AgentRun::new(
+            indwell_core::Event::ChannelMessage {
+                channel: "local_pwa".to_string(),
+                session_id: "provider-high-risk-test".to_string(),
+            },
+            Some("apply update".to_string()),
+            indwell_core::AuthContext::owner("owner", vec![indwell_core::AuthMethod::PairedDevice]),
+            indwell_core::DeviceState::Thinking,
+            indwell_core::ProviderSelection {
+                llm: "mock:phase0".to_string(),
+                vision: None,
+                asr: None,
+                tts: None,
+                embedding: None,
+            },
+            chrono::Utc::now().timestamp_millis() as u64,
+        );
+        run.allowed_tools
+            .push(crate::tools::lookup_tool("system.update.apply"));
+
+        execute_provider_tool_calls(
+            &state,
+            &mut run,
+            vec![indwell_provider::ToolCall {
+                id: "provider-ota-apply".to_string(),
+                name: "system.update.apply".to_string(),
+                arguments: json!({}),
+            }],
+        )
+        .await;
+
+        assert!(run.audit.tool_calls.iter().any(|call| {
+            call.tool == "system.update.apply"
+                && call.outcome == indwell_core::ToolAuditOutcome::Blocked
+                && call.summary.contains("requires explicit confirmation")
+        }));
+        assert!(run.audit.policy_blocks.iter().any(|block| {
+            block.contains("system.update.apply")
+                && block.contains("requires explicit confirmation")
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn manual_memory_can_be_deleted_through_tool_runtime() {
         let root = temp_root("memory-delete-tool");
         let _ = std::fs::remove_dir_all(&root);
@@ -2825,6 +2818,41 @@ mod tests {
             })
             .unwrap();
         assert!(records.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn protected_tool_execute_uses_authorization_session_without_body_token() {
+        let root = temp_root("tool-execute-header-session");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let token = issue_test_session(&state).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/memory.delete/execute")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "input": {}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = response_data(response).await;
+        assert_eq!(data["decision"], "allow");
+        assert_eq!(data["output"]["deleted"], false);
+        assert_eq!(data["output"]["reason"], "missing memory id");
         let _ = std::fs::remove_dir_all(root);
     }
 

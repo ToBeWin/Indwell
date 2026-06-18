@@ -15,6 +15,7 @@ Phase 0 implements the policy shape that Proto v1 needs:
 - Unauthenticated channel memories are quarantined under `inbox/unverified`.
 - Dynamic passphrase challenges can be verified once and converted into scoped confirmation grants.
 - Confirmation grants are subject-bound, tool-bound, expiring, and single-use.
+- Provider-returned or planner-generated tool calls cannot execute high-risk tools without an explicit confirmation path.
 - OTA manifest signatures can be verified with Ed25519 public keys.
 - Local secrets can be sealed and opened with ChaCha20-Poly1305 primitives.
 

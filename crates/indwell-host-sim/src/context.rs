@@ -1,9 +1,9 @@
+use crate::tools::tool_specs_from_descriptors;
 use indwell_channel::{ChannelKind, ChannelPolicy};
 use indwell_core::{default_tools, AgentRun, AuthContext, DeviceState, ToolDescriptor};
 use indwell_memory::{MemoryQuery, MemoryRecord};
-use indwell_provider::{ChatMessage, ChatRequest, ToolSpec};
+use indwell_provider::{ChatMessage, ChatRequest};
 use indwell_security::{PolicyDecision, PolicyEngine};
-use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
 pub struct ContextAssembly {
@@ -151,67 +151,6 @@ pub fn contextual_chat_request(run: &AgentRun, user_text: &str) -> ChatRequest {
     ChatRequest {
         messages,
         tools: tool_specs_from_descriptors(&run.allowed_tools),
-    }
-}
-
-pub fn tool_specs_from_descriptors(tools: &[ToolDescriptor]) -> Vec<ToolSpec> {
-    tools
-        .iter()
-        .map(|tool| ToolSpec {
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            input_schema: tool_input_schema(&tool.name),
-        })
-        .collect()
-}
-
-pub fn tool_input_schema(tool: &str) -> Value {
-    match tool {
-        "device.led.set" => json!({
-            "type": "object",
-            "properties": { "color": { "type": "string" } },
-            "required": ["color"],
-        }),
-        "device.speaker.speak" => json!({
-            "type": "object",
-            "properties": { "text": { "type": "string" } },
-            "required": ["text"],
-        }),
-        "memory.search" => json!({
-            "type": "object",
-            "properties": {
-                "wing": { "type": ["string", "null"] },
-                "room": { "type": ["string", "null"] },
-                "text": { "type": ["string", "null"] },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
-            },
-        }),
-        "memory.write_candidate" => json!({
-            "type": "object",
-            "properties": {
-                "wing": { "type": "string" },
-                "room": { "type": "string" },
-                "content": { "type": "string" }
-            },
-            "required": ["content"],
-        }),
-        "memory.delete" => json!({
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-        }),
-        "device.camera.capture" => json!({
-            "type": "object",
-            "properties": {
-                "analyze": { "type": "boolean" },
-                "prompt": { "type": "string" }
-            },
-        }),
-        "device.sensor.read" => json!({
-            "type": "object",
-            "properties": { "sensor": { "type": "string" } },
-        }),
-        _ => json!({ "type": "object" }),
     }
 }
 
