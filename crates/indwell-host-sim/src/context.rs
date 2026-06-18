@@ -1,7 +1,9 @@
 use indwell_channel::{ChannelKind, ChannelPolicy};
-use indwell_core::{default_tools, AuthContext, DeviceState, ToolDescriptor};
+use indwell_core::{default_tools, AgentRun, AuthContext, DeviceState, ToolDescriptor};
 use indwell_memory::{MemoryQuery, MemoryRecord};
+use indwell_provider::{ChatMessage, ChatRequest, ToolSpec};
 use indwell_security::{PolicyDecision, PolicyEngine};
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
 pub struct ContextAssembly {
@@ -90,6 +92,175 @@ pub fn apply_context_pack(
     }
 }
 
+pub fn contextual_chat_request(run: &AgentRun, user_text: &str) -> ChatRequest {
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: system_contract(),
+    }];
+
+    if let Some(persona) = run.context_pack.persona_snapshot.as_deref() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: format!("Persona Snapshot:\n{}", compact_text(persona, 600)),
+        });
+    }
+
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: format!(
+            "Current Device State: {:?}",
+            run.context_pack.current_device_state
+        ),
+    });
+
+    if !run.context_pack.retrieved_memories.is_empty() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: format!(
+                "Retrieved Memories:\n{}",
+                compact_lines(&run.context_pack.retrieved_memories, 6, 900)
+            ),
+        });
+    }
+
+    if !run.context_pack.recent_turns.is_empty() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: format!(
+                "Recent Turns:\n{}",
+                compact_lines(&run.context_pack.recent_turns, 6, 900)
+            ),
+        });
+    }
+
+    if !run.audit.policy_blocks.is_empty() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: format!(
+                "Policy Blocks:\n{}",
+                compact_lines(&run.audit.policy_blocks, 4, 500)
+            ),
+        });
+    }
+
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: user_text.to_string(),
+    });
+
+    ChatRequest {
+        messages,
+        tools: tool_specs_from_descriptors(&run.allowed_tools),
+    }
+}
+
+pub fn tool_specs_from_descriptors(tools: &[ToolDescriptor]) -> Vec<ToolSpec> {
+    tools
+        .iter()
+        .map(|tool| ToolSpec {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            input_schema: tool_input_schema(&tool.name),
+        })
+        .collect()
+}
+
+pub fn tool_input_schema(tool: &str) -> Value {
+    match tool {
+        "device.led.set" => json!({
+            "type": "object",
+            "properties": { "color": { "type": "string" } },
+            "required": ["color"],
+        }),
+        "device.speaker.speak" => json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+            "required": ["text"],
+        }),
+        "memory.search" => json!({
+            "type": "object",
+            "properties": {
+                "wing": { "type": ["string", "null"] },
+                "room": { "type": ["string", "null"] },
+                "text": { "type": ["string", "null"] },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+            },
+        }),
+        "memory.write_candidate" => json!({
+            "type": "object",
+            "properties": {
+                "wing": { "type": "string" },
+                "room": { "type": "string" },
+                "content": { "type": "string" }
+            },
+            "required": ["content"],
+        }),
+        "memory.delete" => json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+        }),
+        "device.camera.capture" => json!({
+            "type": "object",
+            "properties": {
+                "analyze": { "type": "boolean" },
+                "prompt": { "type": "string" }
+            },
+        }),
+        "device.sensor.read" => json!({
+            "type": "object",
+            "properties": { "sensor": { "type": "string" } },
+        }),
+        _ => json!({ "type": "object" }),
+    }
+}
+
+fn system_contract() -> String {
+    [
+        "You are the Indwell OS companion agent running from a local-first device runtime.",
+        "Use only the relevant provided memories and tools; do not assume full history is available.",
+        "For sensitive or high-risk actions, prefer confirmation and explain the safety boundary briefly.",
+        "Keep replies concise and useful for an embodied device.",
+    ]
+    .join(" ")
+}
+
+fn compact_lines(lines: &[String], max_lines: usize, max_chars: usize) -> String {
+    let mut rendered = String::new();
+    for (index, line) in lines.iter().take(max_lines).enumerate() {
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str("- ");
+        rendered.push_str(&compact_text(
+            line,
+            max_chars.saturating_sub(rendered.len()),
+        ));
+        if rendered.len() >= max_chars {
+            break;
+        }
+        if index + 1 == max_lines && lines.len() > max_lines {
+            rendered.push_str("\n- ...");
+        }
+    }
+    rendered
+}
+
+fn compact_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let end = trimmed
+        .char_indices()
+        .take_while(|(index, _)| *index < max_chars.saturating_sub(1))
+        .last()
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    format!("{}...", &trimmed[..end])
+}
+
 fn meaningful_query_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.len() < 3 {
@@ -160,11 +331,11 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use indwell_channel::ChannelKind;
-    use indwell_core::AuthContext;
+    use indwell_core::{AgentRun, AuthContext, DeviceState, Event, ProviderSelection};
     use indwell_memory::{MemoryKind, MemoryRecord, MemorySource};
     use indwell_security::PolicyEngine;
 
-    use super::ContextAssembler;
+    use super::{apply_context_pack, contextual_chat_request, ContextAssembler};
 
     #[test]
     fn local_pwa_gets_relevant_memory_tools() {
@@ -227,5 +398,70 @@ mod tests {
         );
 
         assert_eq!(assembly.retrieved_memories.len(), 1);
+    }
+
+    #[test]
+    fn contextual_chat_request_includes_memory_and_keeps_user_text_last() {
+        let assembler = ContextAssembler::default();
+        let memory = MemoryRecord::new(
+            MemoryKind::Preference,
+            "user_owner",
+            "preferences",
+            "User prefers quiet blue lights after dinner.",
+            MemorySource::UserSaid,
+            1,
+        );
+        let assembly = assembler.assemble(
+            "remember my lighting preference",
+            ChannelKind::LocalPwa,
+            vec![memory],
+            &PolicyEngine,
+            &AuthContext::anonymous(),
+        );
+        let mut run = AgentRun::new(
+            Event::ChannelMessage {
+                channel: "local_pwa".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            Some("remember my lighting preference".to_string()),
+            AuthContext::anonymous(),
+            DeviceState::Thinking,
+            ProviderSelection {
+                llm: "mock:phase0".to_string(),
+                vision: None,
+                asr: None,
+                tts: None,
+                embedding: None,
+            },
+            1,
+        );
+        apply_context_pack(&mut run, DeviceState::Thinking, assembly);
+
+        let request = contextual_chat_request(&run, "remember my lighting preference");
+        let joined = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("Host simulator persona"));
+        assert!(joined.contains("Current Device State: Thinking"));
+        assert!(joined.contains("quiet blue lights"));
+        assert_eq!(
+            request.messages.last().map(|message| message.role.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            request
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("remember my lighting preference")
+        );
+        assert!(request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "memory.write_candidate"));
     }
 }

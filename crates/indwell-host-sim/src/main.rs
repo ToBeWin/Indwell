@@ -14,7 +14,7 @@ use axum::{
     Extension, Json, Router,
 };
 use chrono::Utc;
-use context::{apply_context_pack, ContextAssembler};
+use context::{apply_context_pack, contextual_chat_request, tool_input_schema, ContextAssembler};
 use indwell_channel::{
     BasicChannelAdapter, ChannelAdapter, ChannelEvent, ChannelInbound, ChannelKind, ChannelPolicy,
     ChannelPrincipal,
@@ -36,7 +36,7 @@ use indwell_protocol::{
 use indwell_provider::{
     AsrProvider, AudioBlob, ChatMessage, ChatRequest, EmbeddingProvider, LlmProvider,
     MockAsrProvider, MockEmbeddingProvider, MockLlmProvider, MockTtsProvider, MockVisionProvider,
-    OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall, ToolSpec, Transcript, TtsProvider,
+    OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall, Transcript, TtsProvider,
     VisionProvider, VisionRequest, VoiceProfile,
 };
 use indwell_reflection::{ReflectionBudget, ReflectionEngine, ReflectionReport};
@@ -166,6 +166,7 @@ struct VoiceTurnRequest {
 
 #[derive(Debug, Serialize)]
 struct VoiceTurnResponse {
+    run_id: String,
     transcript: Transcript,
     reply: String,
     audio: AudioBlob,
@@ -438,7 +439,8 @@ async fn mock_voice_turn(
     Json(req): Json<VoiceTurnRequest>,
 ) -> Result<Json<ApiEnvelope<VoiceTurnResponse>>, AppError> {
     let providers = state.providers.lock().await.load()?;
-    let providers = provider_config_for_ingress(&providers, &AuthContext::anonymous()).0;
+    let auth_context = AuthContext::anonymous();
+    let (providers, provider_policy_note) = provider_config_for_ingress(&providers, &auth_context);
     let transcript = transcribe_with_config(
         &state,
         &providers,
@@ -449,6 +451,56 @@ async fn mock_voice_turn(
         },
     )
     .await?;
+    let mut run = AgentRun::new(
+        Event::AudioCaptured {
+            path: "host-sim://voice/mock-turn".to_string(),
+            duration_ms: req
+                .text_hint
+                .len()
+                .saturating_mul(40)
+                .try_into()
+                .unwrap_or(u32::MAX),
+        },
+        Some(transcript.text.clone()),
+        auth_context,
+        DeviceState::Thinking,
+        ProviderSelection {
+            llm: format!("{}:{}", providers.llm.kind, providers.llm.model),
+            vision: providers
+                .vision
+                .as_ref()
+                .map(|provider| format!("{}:{}", provider.kind, provider.model)),
+            asr: providers
+                .asr
+                .as_ref()
+                .map(|provider| format!("{}:{}", provider.kind, provider.model)),
+            tts: providers
+                .tts
+                .as_ref()
+                .map(|provider| format!("{}:{}", provider.kind, provider.model)),
+            embedding: providers
+                .embedding
+                .as_ref()
+                .map(|provider| format!("{}:{}", provider.kind, provider.model)),
+        },
+        Utc::now().timestamp_millis() as u64,
+    );
+    run.audit.input_summary = Some(transcript.text.clone());
+
+    let memory_query = state.context.memory_query(&transcript.text);
+    let retrieved_memories = state.memory.lock().await.search(memory_query)?;
+    let assembly = state.context.assemble(
+        &transcript.text,
+        ChannelKind::LocalPwa,
+        retrieved_memories,
+        &state.policy,
+        &run.auth_context,
+    );
+    apply_context_pack(&mut run, DeviceState::Thinking, assembly);
+    if let Some(note) = provider_policy_note {
+        run.record_policy_block(note);
+    }
+
     let api_key = match providers.llm.api_key_ref.as_deref() {
         Some(key_ref) => resolve_api_key(&state, key_ref).await?,
         None => None,
@@ -456,13 +508,7 @@ async fn mock_voice_turn(
     let reply = chat_with_config(
         &providers,
         api_key,
-        ChatRequest {
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: transcript.text.clone(),
-            }],
-            tools: Vec::new(),
-        },
+        contextual_chat_request(&run, &transcript.text),
     )
     .await?
     .text;
@@ -476,8 +522,11 @@ async fn mock_voice_turn(
         },
     )
     .await?;
+    run.finish_with_summary(reply.clone(), Utc::now().timestamp_millis() as u64);
+    state.runs.lock().await.append(&run)?;
 
     Ok(Json(ApiEnvelope::ok(VoiceTurnResponse {
+        run_id: run.id.to_string(),
         transcript,
         reply,
         audio,
@@ -544,18 +593,8 @@ async fn handle_channel_event(
         Some(key_ref) => resolve_api_key(&state, key_ref).await?,
         None => None,
     };
-    let chat_response = chat_with_config(
-        &providers,
-        api_key,
-        ChatRequest {
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: text.clone(),
-            }],
-            tools: tool_specs_from_descriptors(&run.allowed_tools),
-        },
-    )
-    .await?;
+    let chat_response =
+        chat_with_config(&providers, api_key, contextual_chat_request(&run, &text)).await?;
     let reply = chat_response.text;
 
     if chat_response.tool_calls.is_empty() {
@@ -709,17 +748,6 @@ fn command_prompt(command: &MobileCommand) -> String {
         MobileCommand::CheckUpdate => "check update".to_string(),
         MobileCommand::ApplyUpdate { version } => format!("apply update {version}"),
     }
-}
-
-fn tool_specs_from_descriptors(tools: &[ToolDescriptor]) -> Vec<ToolSpec> {
-    tools
-        .iter()
-        .map(|tool| ToolSpec {
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            input_schema: tool_input_schema(&tool.name),
-        })
-        .collect()
 }
 
 async fn execute_planned_tool_calls(state: &AppState, run: &mut AgentRun, text: &str) {
@@ -2124,56 +2152,6 @@ async fn channel_policies() -> Json<ApiEnvelope<ChannelPolicyResponse>> {
     }))
 }
 
-fn tool_input_schema(tool: &str) -> Value {
-    match tool {
-        "device.led.set" => json!({
-            "type": "object",
-            "properties": { "color": { "type": "string" } },
-            "required": ["color"],
-        }),
-        "device.speaker.speak" => json!({
-            "type": "object",
-            "properties": { "text": { "type": "string" } },
-            "required": ["text"],
-        }),
-        "memory.search" => json!({
-            "type": "object",
-            "properties": {
-                "wing": { "type": ["string", "null"] },
-                "room": { "type": ["string", "null"] },
-                "text": { "type": ["string", "null"] },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
-            },
-        }),
-        "memory.write_candidate" => json!({
-            "type": "object",
-            "properties": {
-                "wing": { "type": "string" },
-                "room": { "type": "string" },
-                "content": { "type": "string" }
-            },
-            "required": ["content"],
-        }),
-        "memory.delete" => json!({
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-        }),
-        "device.camera.capture" => json!({
-            "type": "object",
-            "properties": {
-                "analyze": { "type": "boolean" },
-                "prompt": { "type": "string" }
-            },
-        }),
-        "device.sensor.read" => json!({
-            "type": "object",
-            "properties": { "sensor": { "type": "string" } },
-        }),
-        _ => json!({ "type": "object" }),
-    }
-}
-
 fn tool_output_schema(tool: &str) -> Value {
     match tool {
         "system.status" => json!({
@@ -3192,7 +3170,7 @@ mod tests {
             .await
             .save(&external_provider_config())
             .unwrap();
-        let app = build_router(state);
+        let app = build_router(state.clone());
 
         let response = app
             .oneshot(
@@ -3219,6 +3197,22 @@ mod tests {
             .unwrap()
             .starts_with("Indwell mock response"));
         assert_eq!(data["audio"]["mime_type"].as_str(), Some("audio/wav"));
+        let run_id = data["run_id"].as_str().unwrap();
+        let run = state
+            .runs
+            .lock()
+            .await
+            .get(uuid::Uuid::parse_str(run_id).unwrap())
+            .unwrap()
+            .expect("voice turn run should be stored");
+        assert!(run
+            .audit
+            .input_summary
+            .as_deref()
+            .unwrap()
+            .starts_with("mock transcript for"));
+        assert!(run.context_pack.persona_snapshot.is_some());
+        assert_eq!(run.provider.llm, "mock:mock:phase0");
         let _ = std::fs::remove_dir_all(root);
     }
 
