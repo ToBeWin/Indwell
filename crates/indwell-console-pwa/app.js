@@ -68,6 +68,7 @@ const els = {
   memoryResult: document.querySelector("#memoryResult"),
   memoryExportResult: document.querySelector("#memoryExportResult"),
   refreshMemoryButton: document.querySelector("#refreshMemoryButton"),
+  reviewInboxButton: document.querySelector("#reviewInboxButton"),
   exportMemoryButton: document.querySelector("#exportMemoryButton"),
   metabolizeMemoryButton: document.querySelector("#metabolizeMemoryButton"),
   reflectionForm: document.querySelector("#reflectionForm"),
@@ -371,6 +372,8 @@ function collectNewMemory() {
 
 function renderMemoryCard(record) {
   const encoded = encodeURIComponent(JSON.stringify(record));
+  const tags = Array.isArray(record.tags) ? record.tags : [];
+  const isUnverified = tags.includes("unverified_ingress");
   return `
     <section class="memory-card" data-memory-id="${escapeHtml(record.id)}">
       <header>
@@ -379,10 +382,12 @@ function renderMemoryCard(record) {
         <span>${escapeHtml(formatTime(record.created_at_ms))}</span>
       </header>
       <p>${escapeHtml(record.content)}</p>
-      <p class="subtle">ID: ${escapeHtml(record.id)} · source: ${escapeHtml(formatMemorySource(record.source))} · confidence: ${escapeHtml(record.confidence ?? "n/a")}</p>
+      <p class="subtle">ID: ${escapeHtml(record.id)} · source: ${escapeHtml(formatMemorySource(record.source))} · confidence: ${escapeHtml(record.confidence ?? "n/a")}${isUnverified ? " · inbox/unverified" : ""}</p>
       <div class="memory-card-actions">
         <button class="secondary compact" type="button" data-memory-copy-id="${escapeHtml(record.id)}">Copy ID</button>
+        <button class="secondary compact" type="button" data-memory-audit-id="${escapeHtml(record.id)}">Audit</button>
         <button class="secondary compact" type="button" data-memory-json="${encoded}">Show JSON</button>
+        ${isUnverified ? `<button class="secondary compact" type="button" data-memory-accept-id="${escapeHtml(record.id)}">Accept</button>` : ""}
         <button class="secondary compact danger" type="button" data-memory-delete-id="${escapeHtml(record.id)}">Delete</button>
       </div>
     </section>
@@ -786,6 +791,17 @@ async function refreshMemorySearch() {
   await runMemorySearch(query, els.refreshMemoryButton);
 }
 
+async function reviewMemoryInbox() {
+  const query = {
+    wing: "inbox",
+    room: "unverified",
+    text: null,
+    limit: 50,
+  };
+  lastMemoryQuery = query;
+  await runMemorySearch(query, els.reviewInboxButton);
+}
+
 async function addMemory(event) {
   event.preventDefault();
   if (!requireSessionFor(els.memoryResult, "memory")) {
@@ -814,6 +830,67 @@ async function addMemory(event) {
       <pre class="json-preview">${escapeHtml(formatJson(record))}</pre>
     `;
     await refreshMemorySearch();
+  } catch (error) {
+    renderError(els.memoryExportResult, error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function auditMemory(memoryId, button) {
+  if (!requireSessionFor(els.memoryExportResult, "memory audit")) {
+    return;
+  }
+  setBusy(button, true);
+
+  try {
+    const audit = await requestJson(`/v1/memory/${encodeURIComponent(memoryId)}/audit`);
+    els.memoryExportResult.classList.remove("empty");
+    els.memoryExportResult.innerHTML = `
+      <strong>Memory audit</strong>
+      <dl class="kv">
+        <div><dt>ID</dt><dd>${escapeHtml(audit.record?.id || memoryId)}</dd></div>
+        <div><dt>Status</dt><dd>${escapeHtml(audit.status)}</dd></div>
+        <div><dt>Related run</dt><dd>${escapeHtml(audit.related_run_id || "none")}</dd></div>
+        <div><dt>Recommendation</dt><dd>${escapeHtml(audit.recommendation)}</dd></div>
+      </dl>
+      <pre class="json-preview">${escapeHtml(formatJson(audit))}</pre>
+    `;
+  } catch (error) {
+    renderError(els.memoryExportResult, error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function acceptMemory(memoryId, button) {
+  if (!requireSessionFor(els.memoryExportResult, "memory review")) {
+    return;
+  }
+  setBusy(button, true);
+
+  try {
+    const accepted = await requestJson(`/v1/memory/${encodeURIComponent(memoryId)}/accept`, {
+      method: "POST",
+      body: {
+        wing: "user_unknown",
+        room: "episodes",
+        confidence: 0.75,
+        importance: 0.45,
+      },
+    });
+    els.memoryExportResult.classList.remove("empty");
+    els.memoryExportResult.innerHTML = `
+      <strong>Inbox memory accepted</strong>
+      <dl class="kv">
+        <div><dt>ID</dt><dd>${escapeHtml(accepted.record?.id || memoryId)}</dd></div>
+        <div><dt>Room</dt><dd>${escapeHtml(accepted.record?.wing || "unknown")} / ${escapeHtml(accepted.record?.room || "unknown")}</dd></div>
+        <div><dt>Confidence</dt><dd>${escapeHtml(accepted.record?.confidence ?? "n/a")}</dd></div>
+      </dl>
+      <pre class="json-preview">${escapeHtml(formatJson(accepted.record || accepted))}</pre>
+    `;
+    await refreshMemorySearch();
+    refreshRuns();
   } catch (error) {
     renderError(els.memoryExportResult, error);
   } finally {
@@ -1525,6 +1602,7 @@ els.voiceForm.addEventListener("submit", runVoiceTurn);
 els.memoryForm.addEventListener("submit", searchMemory);
 els.addMemoryForm.addEventListener("submit", addMemory);
 els.refreshMemoryButton.addEventListener("click", refreshMemorySearch);
+els.reviewInboxButton.addEventListener("click", reviewMemoryInbox);
 els.exportMemoryButton.addEventListener("click", exportMemory);
 els.metabolizeMemoryButton.addEventListener("click", metabolizeMemory);
 els.memoryResult.addEventListener("click", (event) => {
@@ -1534,9 +1612,21 @@ els.memoryResult.addEventListener("click", (event) => {
     return;
   }
 
+  const auditButton = event.target.closest("[data-memory-audit-id]");
+  if (auditButton) {
+    auditMemory(auditButton.dataset.memoryAuditId, auditButton);
+    return;
+  }
+
   const jsonButton = event.target.closest("[data-memory-json]");
   if (jsonButton) {
     showMemoryJson(jsonButton.dataset.memoryJson);
+    return;
+  }
+
+  const acceptButton = event.target.closest("[data-memory-accept-id]");
+  if (acceptButton) {
+    acceptMemory(acceptButton.dataset.memoryAcceptId, acceptButton);
     return;
   }
 

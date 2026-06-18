@@ -104,6 +104,31 @@ struct CreateMemoryRequest {
     content: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AcceptMemoryRequest {
+    wing: Option<String>,
+    room: Option<String>,
+    kind: Option<MemoryKind>,
+    sensitivity: Option<Sensitivity>,
+    confidence: Option<f32>,
+    importance: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryAuditResponse {
+    record: MemoryRecord,
+    status: String,
+    recommendation: String,
+    related_run_id: Option<String>,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AcceptMemoryResponse {
+    accepted: bool,
+    record: MemoryRecord,
+}
+
 #[derive(Debug, Serialize)]
 struct ToolDecisionResponse {
     tool: String,
@@ -296,6 +321,8 @@ fn build_router(state: AppState) -> Router {
 
     let protected_routes = Router::new()
         .route("/v1/memory", post(create_memory))
+        .route("/v1/memory/:id/accept", post(accept_memory))
+        .route("/v1/memory/:id/audit", get(audit_memory))
         .route("/v1/memory/export", get(export_memory))
         .route("/v1/memory/metabolize", post(metabolize_memory))
         .route("/v1/memory/search", post(search_memory))
@@ -955,6 +982,70 @@ fn api_key_env_name(api_key_ref: &str) -> String {
     format!("INDWELL_SECRET_{suffix}")
 }
 
+fn memory_audit_response(record: MemoryRecord) -> MemoryAuditResponse {
+    let is_unverified = record.tags.iter().any(|tag| tag == "unverified_ingress");
+    let related_run_id = match &record.source {
+        MemorySource::AgentRun { run_id } => Some(run_id.clone()),
+        _ => None,
+    };
+    let mut evidence = vec![
+        format!("source={}", memory_source_label(&record.source)),
+        format!("wing_room={}/{}", record.wing, record.room),
+        format!("confidence={:.2}", record.confidence),
+        format!("importance={:.2}", record.importance),
+        format!("sensitivity={:?}", record.sensitivity),
+    ];
+    if !record.tags.is_empty() {
+        evidence.push(format!("tags={}", record.tags.join(",")));
+    }
+    if let Some(verbatim_ref) = record.verbatim_ref.as_deref() {
+        evidence.push(format!("verbatim_ref={verbatim_ref}"));
+    }
+
+    let (status, recommendation) = if is_unverified {
+        (
+            "unverified".to_string(),
+            "Review this inbox memory before it can influence long-term persona or relationship snapshots."
+                .to_string(),
+        )
+    } else if matches!(record.ttl_policy, TtlPolicy::Review) {
+        (
+            "review".to_string(),
+            "Memory is available but still marked for future review or metabolism.".to_string(),
+        )
+    } else {
+        (
+            "accepted".to_string(),
+            "Memory is accepted for normal local-first retrieval and snapshots.".to_string(),
+        )
+    };
+
+    MemoryAuditResponse {
+        record,
+        status,
+        recommendation,
+        related_run_id,
+        evidence,
+    }
+}
+
+fn memory_source_label(source: &MemorySource) -> String {
+    match source {
+        MemorySource::UserSaid => "user_said".to_string(),
+        MemorySource::DeviceEvent => "device_event".to_string(),
+        MemorySource::AgentRun { run_id } => format!("agent_run:{run_id}"),
+        MemorySource::Reflection => "reflection".to_string(),
+        MemorySource::Imported => "imported".to_string(),
+        MemorySource::Manual => "manual".to_string(),
+    }
+}
+
+fn push_unique_tag(tags: &mut Vec<String>, tag: &str) {
+    if !tags.iter().any(|existing| existing == tag) {
+        tags.push(tag.to_string());
+    }
+}
+
 fn decode_hex_or_utf8(value: &str) -> Result<Vec<u8>, AppError> {
     let trimmed = value.trim();
     if trimmed.len() % 2 == 0 && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -992,6 +1083,58 @@ async fn create_memory(
     );
     state.memory.lock().await.append(record.clone())?;
     Ok(Json(ApiEnvelope::ok(record)))
+}
+
+async fn audit_memory(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiEnvelope<MemoryAuditResponse>>, AppError> {
+    let record = state
+        .memory
+        .lock()
+        .await
+        .get(&id)?
+        .ok_or_else(|| AppError::MemoryNotFound(id.clone()))?;
+    Ok(Json(ApiEnvelope::ok(memory_audit_response(record))))
+}
+
+async fn accept_memory(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AcceptMemoryRequest>,
+) -> Result<Json<ApiEnvelope<AcceptMemoryResponse>>, AppError> {
+    let now_ms = Utc::now().timestamp_millis() as u64;
+    let mut memory = state.memory.lock().await;
+    let mut record = memory
+        .get(&id)?
+        .ok_or_else(|| AppError::MemoryNotFound(id.clone()))?;
+    record.wing = req.wing.unwrap_or_else(|| "user_unknown".to_string());
+    record.room = req.room.unwrap_or_else(|| "episodes".to_string());
+    if let Some(kind) = req.kind {
+        record.kind = kind;
+    }
+    if let Some(sensitivity) = req.sensitivity {
+        record.sensitivity = sensitivity;
+    }
+    if let Some(confidence) = req.confidence {
+        record.confidence = confidence.clamp(0.0, 1.0);
+    } else if record.confidence < 0.65 {
+        record.confidence = 0.65;
+    }
+    if let Some(importance) = req.importance {
+        record.importance = importance.clamp(0.0, 1.0);
+    } else if record.importance < 0.4 {
+        record.importance = 0.4;
+    }
+    record.updated_at_ms = now_ms;
+    record.tags.retain(|tag| tag != "unverified_ingress");
+    push_unique_tag(&mut record.tags, "reviewed_by_owner");
+    push_unique_tag(&mut record.tags, "accepted_from_inbox");
+    memory.append(record.clone())?;
+    Ok(Json(ApiEnvelope::ok(AcceptMemoryResponse {
+        accepted: true,
+        record,
+    })))
 }
 
 async fn export_memory(
@@ -2018,6 +2161,7 @@ enum AppError {
     Reflection(indwell_reflection::ReflectionError),
     Json(serde_json::Error),
     UnsupportedProviderKind(String),
+    MemoryNotFound(String),
     InvalidHex,
     UnknownPairedDevice,
     MissingSessionToken,
@@ -2091,6 +2235,7 @@ impl IntoResponse for AppError {
             Self::Reflection(err) => err.to_string(),
             Self::Json(err) => err.to_string(),
             Self::UnsupportedProviderKind(kind) => format!("unsupported provider kind: {kind}"),
+            Self::MemoryNotFound(id) => format!("memory not found: {id}"),
             Self::InvalidHex => "invalid hex input".to_string(),
             Self::UnknownPairedDevice => "paired device not found".to_string(),
             Self::MissingSessionToken => "missing session token".to_string(),
@@ -2634,6 +2779,110 @@ mod tests {
             })
             .unwrap();
         assert!(records.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn inbox_memory_can_be_audited_and_accepted() {
+        let root = temp_root("memory-inbox-review");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let mut record = MemoryRecord::new(
+            indwell_memory::MemoryKind::Episodic,
+            "inbox",
+            "unverified",
+            "public channel said the owner likes quiet evenings",
+            indwell_memory::MemorySource::AgentRun {
+                run_id: "run-inbox-review".to_string(),
+            },
+            chrono::Utc::now().timestamp_millis() as u64,
+        );
+        record.tags.push("unverified_ingress".to_string());
+        record.confidence = 0.35;
+        let memory_id = record.id.clone();
+        state.memory.lock().await.append(record).unwrap();
+        let token = issue_test_session(&state).await;
+        let app = build_router(state.clone());
+
+        let audit_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/memory/{memory_id}/audit"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit_response.status(), StatusCode::OK);
+        let audit = response_data(audit_response).await;
+        assert_eq!(audit["status"], "unverified");
+        assert_eq!(audit["related_run_id"], "run-inbox-review");
+
+        let accept_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/memory/{memory_id}/accept"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        json!({
+                            "wing": "user_unknown",
+                            "room": "episodes",
+                            "confidence": 0.8,
+                            "importance": 0.5
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accept_response.status(), StatusCode::OK);
+        let accepted = response_data(accept_response).await;
+        assert_eq!(accepted["accepted"], true);
+        assert_eq!(accepted["record"]["wing"], "user_unknown");
+        assert_eq!(accepted["record"]["room"], "episodes");
+
+        let inbox_records = state
+            .memory
+            .lock()
+            .await
+            .search(MemoryQuery {
+                wing: Some("inbox".to_string()),
+                room: Some("unverified".to_string()),
+                text: Some("quiet evenings".to_string()),
+                limit: Some(10),
+            })
+            .unwrap();
+        assert!(inbox_records.is_empty());
+
+        let accepted_records = state
+            .memory
+            .lock()
+            .await
+            .search(MemoryQuery {
+                wing: Some("user_unknown".to_string()),
+                room: Some("episodes".to_string()),
+                text: Some("quiet evenings".to_string()),
+                limit: Some(10),
+            })
+            .unwrap();
+        assert_eq!(accepted_records.len(), 1);
+        assert!(!accepted_records[0]
+            .tags
+            .iter()
+            .any(|tag| tag == "unverified_ingress"));
+        assert!(accepted_records[0]
+            .tags
+            .iter()
+            .any(|tag| tag == "reviewed_by_owner"));
+        assert!(accepted_records[0]
+            .tags
+            .iter()
+            .any(|tag| tag == "accepted_from_inbox"));
         let _ = std::fs::remove_dir_all(root);
     }
 

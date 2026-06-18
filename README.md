@@ -83,12 +83,12 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 
 ## Current Phase 0 Surface
 
-- Local memory: append/search/delete/compact/export over JSONL drawers, with PWA add/delete/JSON inspection controls.
+- Local memory: append/search/delete/compact/export over JSONL drawers, with PWA add/delete/audit/accept/JSON inspection controls.
 - Memory metabolism: TTL expiry, decay, and preference consolidation into reflection records.
 - Reflection Engine: derives preference, relationship, emotional, and skill memories from episodic records with source tags.
 - Channel gateway: local PWA, LAN/BLE/USB style channels, chat app style channels, MQTT/Home Assistant/custom webhook normalization.
 - Policy engine: tool risk levels, owner checks, high-risk confirmation gates, public-channel camera blocking.
-- Public ingress guard: unauthenticated channel and mock voice ingress cannot spend user-owned provider keys; unverified input is quarantined in `inbox/unverified`.
+- Public ingress guard: unauthenticated channel and mock voice ingress cannot spend user-owned provider keys; unverified input is quarantined in `inbox/unverified` for owner review.
 - Agent run audit: trigger, retrieved memories, written memories, exposed tools, policy blocks, provider output summary.
 - Provider config: local JSON config with API key references, rejecting raw API keys in config.
 - Provider runtime: mock by default, plus OpenAI-compatible HTTP chat, structured tool calls, vision, ASR, TTS, and embedding paths for host/desktop.
@@ -98,7 +98,7 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 - Confirmation grants: high-risk tools require a valid session plus a scoped, single-use passphrase grant.
 - Tool runtime: provider-returned structured tool calls, planner fallback, status, LED, speaker, camera capture mock, sensor read mock, memory search/write/delete, identity, confirmation, OTA check.
 - OTA: local manifest store, shape checks, HTTPS URL check, SHA-256 format check, Ed25519 manifest signature verification, apply plan, slot alternation.
-- Console PWA: LLM/Vision/ASR/TTS/Embedding provider config, channel input, custom webhook, memory add/search/delete/export/JSON inspection, tool catalog/runtime, OTA manifest/check, run audit, raw API log.
+- Console PWA: LLM/Vision/ASR/TTS/Embedding provider config, channel input, custom webhook, memory add/search/delete/inbox review/export/JSON inspection, tool catalog/runtime, OTA manifest/check, run audit, raw API log.
 - Firmware scaffold: ESP32-S3 boot plan, HAL boundary, partition table, and sdkconfig defaults.
 - ESP-IDF driver map: Proto v1 peripheral bindings to HAL traits.
 - Protocol provisioning schema: Wi-Fi password references and provider config without raw secrets.

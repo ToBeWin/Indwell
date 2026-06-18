@@ -8,6 +8,10 @@ Implemented:
 - Tombstone deletes.
 - Search by wing, room, and text.
 - PWA add/search/delete/export/JSON inspection controls.
+- Inbox review for unauthenticated ingress memories in `inbox/unverified`.
+- Protected memory audit and accept endpoints:
+  - `GET /v1/memory/:id/audit`
+  - `POST /v1/memory/:id/accept`
 - Delete requests through the tool runtime for AgentRun audit coverage.
 - Compacting active records into `compacted.jsonl`.
 - Export with generated snapshots:
@@ -23,7 +27,7 @@ Implemented:
 Next layers:
 
 - Reflection-generated candidate memories.
-- Richer user-visible audit reasons.
+- General-purpose edit/update workflow for already accepted memories.
 - Retention budgets for verbatim audio/image references.
 - Decay and consolidation schedules.
 - Optional vector index for host / phone / stronger hardware.
