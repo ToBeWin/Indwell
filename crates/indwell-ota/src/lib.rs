@@ -239,6 +239,34 @@ pub fn plan_ota_apply(
             .join(", ");
         return Err(OtaError::VerificationFailed(failed));
     }
+    build_ota_apply_plan(manifest, current_version, current_slot)
+}
+
+pub fn plan_trusted_ota_apply(
+    manifest: &OtaManifest,
+    trust: &OtaTrustStore,
+    expected_target: &str,
+    current_version: &str,
+    current_slot: OtaSlot,
+) -> Result<OtaApplyPlan, OtaError> {
+    let report = trust.verify_manifest(manifest, expected_target);
+    if !report.valid {
+        let failed = report
+            .failures()
+            .into_iter()
+            .map(|check| check.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(OtaError::VerificationFailed(failed));
+    }
+    build_ota_apply_plan(manifest, current_version, current_slot)
+}
+
+fn build_ota_apply_plan(
+    manifest: &OtaManifest,
+    current_version: &str,
+    current_slot: OtaSlot,
+) -> Result<OtaApplyPlan, OtaError> {
     if manifest.version == current_version {
         return Err(OtaError::AlreadyInstalled(manifest.version.clone()));
     }
@@ -325,9 +353,9 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     use super::{
-        bytes_to_hex, hex_sha256, manifest_signature_payload, plan_ota_apply, verify_firmware_hash,
-        verify_manifest_shape, verify_manifest_signature, OtaError, OtaManifest, OtaSlot,
-        OtaTrustStore,
+        bytes_to_hex, hex_sha256, manifest_signature_payload, plan_ota_apply,
+        plan_trusted_ota_apply, verify_firmware_hash, verify_manifest_shape,
+        verify_manifest_signature, OtaError, OtaManifest, OtaSlot, OtaTrustStore,
     };
 
     #[test]
@@ -384,6 +412,24 @@ mod tests {
     }
 
     #[test]
+    fn trusted_apply_requires_manifest_signature() {
+        let mut manifest = OtaManifest::host_sim_default();
+        manifest.version = "0.1.1".to_string();
+
+        let error = plan_trusted_ota_apply(
+            &manifest,
+            &OtaTrustStore::empty(),
+            "host-sim",
+            "0.1.0-host-sim",
+            OtaSlot::Ota0,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OtaError::VerificationFailed(_)));
+        assert!(error.to_string().contains("trusted_signature"));
+    }
+
+    #[test]
     fn verifies_ed25519_manifest_signature() {
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let verifying_key = signing_key.verifying_key();
@@ -427,5 +473,31 @@ mod tests {
 
         let untrusted = OtaTrustStore::empty().verify_manifest(&manifest, "host-sim");
         assert!(!untrusted.valid);
+    }
+
+    #[test]
+    fn trusted_apply_plans_signed_manifest() {
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let mut manifest = OtaManifest::host_sim_default();
+        manifest.version = "0.1.1".to_string();
+        manifest.signature = bytes_to_hex(
+            &signing_key
+                .sign(manifest_signature_payload(&manifest).as_bytes())
+                .to_bytes(),
+        );
+        let trust = OtaTrustStore::with_keys([bytes_to_hex(verifying_key.as_bytes())]);
+
+        let plan = plan_trusted_ota_apply(
+            &manifest,
+            &trust,
+            "host-sim",
+            "0.1.0-host-sim",
+            OtaSlot::Ota0,
+        )
+        .expect("trusted apply plan");
+
+        assert_eq!(plan.version, "0.1.1");
+        assert_eq!(plan.to_slot, OtaSlot::Ota1);
     }
 }

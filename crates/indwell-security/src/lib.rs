@@ -230,6 +230,19 @@ pub struct ConfirmationGrantManager {
 }
 
 impl ConfirmationGrantManager {
+    pub fn from_grants(grants: impl IntoIterator<Item = ConfirmationGrant>) -> Self {
+        Self {
+            grants: grants
+                .into_iter()
+                .map(|grant| (grant.grant_id.clone(), grant))
+                .collect(),
+        }
+    }
+
+    pub fn grants(&self) -> Vec<ConfirmationGrant> {
+        self.grants.values().cloned().collect()
+    }
+
     pub fn issue(
         &mut self,
         subject_id: impl Into<String>,
@@ -274,6 +287,39 @@ impl ConfirmationGrantManager {
         }
         grant.consumed_at_ms = Some(now_ms);
         Ok(grant.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonConfirmationGrantStore {
+    path: PathBuf,
+}
+
+impl JsonConfirmationGrantStore {
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, SecurityError> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(secret_store_io)?;
+        }
+        Ok(Self { path })
+    }
+
+    pub fn load(&self) -> Result<Vec<ConfirmationGrant>, SecurityError> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&self.path).map_err(secret_store_io)?;
+        serde_json::from_slice(&bytes).map_err(secret_store_json)
+    }
+
+    pub fn save(&self, grants: &[ConfirmationGrant]) -> Result<(), SecurityError> {
+        let tmp_path = self.path.with_extension("json.tmp");
+        let mut file = fs::File::create(&tmp_path).map_err(secret_store_io)?;
+        serde_json::to_writer_pretty(&mut file, grants).map_err(secret_store_json)?;
+        writeln!(file).map_err(secret_store_io)?;
+        file.flush().map_err(secret_store_io)?;
+        fs::rename(tmp_path, &self.path).map_err(secret_store_io)?;
+        Ok(())
     }
 }
 
@@ -840,9 +886,9 @@ mod tests {
 
     use super::{
         open_secret, pairing_signature_payload, seal_secret, ConfirmationGrantManager,
-        FileSealedSecretStore, InMemorySecretStore, JsonPairedDeviceStore, PairedDevice,
-        PairingManager, PassphraseChallengeManager, PolicyDecision, PolicyEngine, SecurityError,
-        SignedRequest,
+        FileSealedSecretStore, InMemorySecretStore, JsonConfirmationGrantStore,
+        JsonPairedDeviceStore, PairedDevice, PairingManager, PassphraseChallengeManager,
+        PolicyDecision, PolicyEngine, SecurityError, SignedRequest,
     };
 
     #[test]
@@ -1257,5 +1303,32 @@ mod tests {
             manager.consume(&grant.grant_id, "owner", "system.update.apply", 2000),
             Err(SecurityError::ConfirmationGrantExpired)
         ));
+    }
+
+    #[test]
+    fn json_confirmation_grant_store_round_trips_consumed_grants() {
+        let root = std::env::temp_dir().join(format!(
+            "indwell-confirmation-grants-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = JsonConfirmationGrantStore::new(root.join("auth/grants.json")).unwrap();
+        let mut manager = ConfirmationGrantManager::default();
+        let grant = manager.issue("owner", "system.update.apply", 1000, 30_000);
+        manager
+            .consume(&grant.grant_id, "owner", "system.update.apply", 2000)
+            .unwrap();
+
+        store.save(&manager.grants()).unwrap();
+        let loaded = store.load().unwrap();
+        let restored = ConfirmationGrantManager::from_grants(loaded);
+        let restored_grant = restored
+            .grants()
+            .into_iter()
+            .find(|candidate| candidate.grant_id == grant.grant_id)
+            .expect("grant should be restored");
+
+        assert_eq!(restored_grant.consumed_at_ms, Some(2000));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

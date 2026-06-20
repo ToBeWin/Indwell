@@ -1,6 +1,6 @@
 use std::{fs, io, path::PathBuf};
 
-use indwell_ota::{verify_manifest_shape, OtaManifest, OtaTrustStore, OtaVerificationReport};
+use indwell_ota::{OtaManifest, OtaTrustStore, OtaVerificationReport};
 use thiserror::Error;
 
 #[derive(Debug)]
@@ -42,11 +42,7 @@ impl JsonOtaManifestStore {
     ) -> Result<OtaVerificationReport, OtaManifestStoreError> {
         let manifest = self.load()?;
         let trust = self.load_trust_store()?;
-        if trust.trusted_manifest_keys.is_empty() {
-            Ok(verify_manifest_shape(&manifest, expected_target))
-        } else {
-            Ok(trust.verify_manifest(&manifest, expected_target))
-        }
+        Ok(trust.verify_manifest(&manifest, expected_target))
     }
 
     pub fn load_trust_store(&self) -> Result<OtaTrustStore, OtaManifestStoreError> {
@@ -86,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_and_verifies_default_manifest() {
+    fn creates_default_manifest_and_reports_missing_trusted_signature() {
         let root = temp_root("default");
         let _ = std::fs::remove_dir_all(&root);
         let store = JsonOtaManifestStore::new(&root).unwrap();
@@ -95,7 +91,11 @@ mod tests {
         assert_eq!(manifest.target, "host-sim");
 
         let report = store.verify("host-sim").unwrap();
-        assert!(report.valid);
+        assert!(!report.valid);
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.name == "trusted_signature" && !check.passed));
 
         let _ = std::fs::remove_dir_all(root);
     }

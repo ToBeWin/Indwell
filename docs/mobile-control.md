@@ -12,13 +12,13 @@ Implemented in host simulator:
 - `POST /v1/channel/input`
 - `POST /v1/gateway/custom-webhook`
 - paired-device session auth for protected local control APIs
-- dynamic passphrase confirmation grants for high-risk actions
+- dynamic passphrase confirmation grants for high-risk actions, persisted across host restarts after issue/consume
 - channel policy defaults for local, LAN, chat apps, MQTT, Home Assistant, and custom webhooks
 - mobile command normalization for command-style events
 - run audit for every channel input and mock voice turn, including replayable checkpoint entries and failed provider/tool outcomes
 - context-aware LLM requests that include compact persona/device/memory/policy context
 - owner-authenticated camera capture can request Vision Provider analysis
-- OTA Apply checks for a scoped `system.update.apply` confirmation grant before executing
+- OTA Check/Apply require a trust-store manifest signature; Apply also checks for a scoped `system.update.apply` confirmation grant before executing
 - public ingress quarantine for unauthenticated channel memory
 - mock-provider fallback for unauthenticated ingress when real providers are configured
 

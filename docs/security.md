@@ -14,9 +14,9 @@ Phase 0 implements the policy shape that Proto v1 needs:
 - Unauthenticated public ingress is forced to mock providers when real provider config exists.
 - Unauthenticated channel memories are quarantined under `inbox/unverified`.
 - Dynamic passphrase challenges can be verified once and converted into scoped confirmation grants.
-- Confirmation grants are subject-bound, tool-bound, expiring, and single-use.
+- Confirmation grants are subject-bound, tool-bound, expiring, single-use, and persisted locally so consumed grants cannot be replayed after restart.
 - Provider-returned or planner-generated tool calls cannot execute high-risk tools without an explicit confirmation path.
-- OTA manifest signatures can be verified with Ed25519 public keys.
+- OTA manifest signatures are verified against the local trust store with Ed25519 public keys before check/apply reports success.
 - Local secrets can be sealed and opened with ChaCha20-Poly1305 primitives.
 
 Host simulator secrets are sealed at rest for local development. ESP32-S3 and production builds must replace this with encrypted local storage backed by ESP-IDF NVS or a platform keystore.
@@ -42,7 +42,8 @@ Public bootstrap routes:
 
 The PWA confirmation panel lets a local owner bind a passphrase grant to an
 exact tool name. OTA Apply uses `system.update.apply`; the tool executor rejects
-the apply request until a matching, unexpired, single-use grant is supplied.
+the apply request until a matching, unexpired, single-use grant is supplied and
+the manifest signature validates against a trusted OTA public key.
 
 Low-trust ingress routes are not allowed to spend user-owned model API keys.
 When the stored provider config points to a non-mock provider and the request
@@ -107,3 +108,4 @@ High-risk tool execution requires:
 1. a valid paired-device session token
 2. a successful passphrase verification
 3. a matching, unexpired, unconsumed confirmation grant for the exact tool name
+4. for OTA apply, a manifest signature that matches the local trust store

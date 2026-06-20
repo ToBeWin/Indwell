@@ -44,9 +44,9 @@ use indwell_reflection::{ReflectionBudget, ReflectionEngine, ReflectionReport};
 use indwell_runs::{JsonlRunStore, RunLedgerEntry, RunStore};
 use indwell_security::{
     AuthSession, ConfirmationGrant, ConfirmationGrantManager, FileSealedSecretStore,
-    JsonPairedDeviceStore, PairedDevice, PairingChallenge, PairingManager, PassphraseChallenge,
-    PassphraseChallengeManager, PolicyDecision, PolicyEngine, SessionTokenManager, SignedRequest,
-    StoredSecret,
+    JsonConfirmationGrantStore, JsonPairedDeviceStore, PairedDevice, PairingChallenge,
+    PairingManager, PassphraseChallenge, PassphraseChallengeManager, PolicyDecision, PolicyEngine,
+    SessionTokenManager, SignedRequest, StoredSecret,
 };
 use ota::JsonOtaManifestStore;
 use planner::plan_tool_calls;
@@ -69,6 +69,7 @@ struct AppState {
     paired_devices: Arc<JsonPairedDeviceStore>,
     sessions: Arc<Mutex<SessionTokenManager>>,
     grants: Arc<Mutex<ConfirmationGrantManager>>,
+    confirmation_grants: Arc<JsonConfirmationGrantStore>,
     passphrases: Arc<Mutex<PassphraseChallengeManager>>,
     ota: Arc<Mutex<JsonOtaManifestStore>>,
     context: Arc<ContextAssembler>,
@@ -268,6 +269,9 @@ fn init_state(data_root: PathBuf) -> anyhow::Result<AppState> {
     )?;
     let paired_devices_store = JsonPairedDeviceStore::new(data_root.join("pairing/devices.json"))?;
     let pairing = PairingManager::from_paired_devices(paired_devices_store.load()?);
+    let confirmation_grants_store =
+        JsonConfirmationGrantStore::new(data_root.join("auth/confirmation_grants.json"))?;
+    let grants = ConfirmationGrantManager::from_grants(confirmation_grants_store.load()?);
     let sessions = SessionTokenManager::new(host_secret_store_key(
         std::env::var("INDWELL_HOST_SIM_SESSION_KEY")
             .ok()
@@ -283,7 +287,8 @@ fn init_state(data_root: PathBuf) -> anyhow::Result<AppState> {
         pairing: Arc::new(Mutex::new(pairing)),
         paired_devices: Arc::new(paired_devices_store),
         sessions: Arc::new(Mutex::new(sessions)),
-        grants: Arc::new(Mutex::new(ConfirmationGrantManager::default())),
+        grants: Arc::new(Mutex::new(grants)),
+        confirmation_grants: Arc::new(confirmation_grants_store),
         passphrases: Arc::new(Mutex::new(PassphraseChallengeManager::default())),
         ota: Arc::new(Mutex::new(ota)),
         context: Arc::new(ContextAssembler::default()),
@@ -1686,6 +1691,12 @@ async fn persist_paired_devices(state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
+async fn persist_confirmation_grants(state: &AppState) -> Result<(), AppError> {
+    let grants = state.grants.lock().await.grants();
+    state.confirmation_grants.save(&grants)?;
+    Ok(())
+}
+
 async fn issue_passphrase_challenge(
     State(state): State<AppState>,
 ) -> Json<ApiEnvelope<PassphraseChallenge>> {
@@ -1713,6 +1724,7 @@ async fn verify_passphrase_challenge(
             .lock()
             .await
             .issue(req.subject_id, req.allowed_tool, now_ms, 5 * 60 * 1000);
+    persist_confirmation_grants(&state).await?;
     Ok(Json(ApiEnvelope::ok(VerifyPassphraseResponse {
         verified: true,
         grant,
@@ -1913,6 +1925,7 @@ async fn execute_tool(
                 memory_id: None,
             })));
         }
+        persist_confirmation_grants(&state).await?;
     }
 
     run.status = RunStatus::WaitingForTool;
@@ -2179,7 +2192,7 @@ async fn execute_mock_tool(
         "system.update.check" => Ok(ToolExecution {
             output: {
                 let manifest = state.ota.lock().await.load()?;
-                let report = indwell_ota::verify_manifest_shape(&manifest, "host-sim");
+                let report = state.ota.lock().await.verify("host-sim")?;
                 json!({
                     "update_available": false,
                     "current_version": "0.1.0-host-sim",
@@ -2191,9 +2204,13 @@ async fn execute_mock_tool(
             summary: "checked mock update manifest".to_string(),
         }),
         "system.update.apply" => {
-            let manifest = state.ota.lock().await.load()?;
-            match indwell_ota::plan_ota_apply(
+            let ota = state.ota.lock().await;
+            let manifest = ota.load()?;
+            let trust = ota.load_trust_store()?;
+            drop(ota);
+            match indwell_ota::plan_trusted_ota_apply(
                 &manifest,
+                &trust,
                 "host-sim",
                 "0.1.0-host-sim",
                 OtaSlot::Ota0,
@@ -2366,6 +2383,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use indwell_channel::{ChannelInbound, ChannelKind, ChannelPrincipal};
     use indwell_memory::{MemoryQuery, MemoryRecord, MemoryStore};
+    use indwell_ota::{manifest_signature_payload, OtaManifest, OtaTrustStore};
     use indwell_protocol::{MobileCommand, ProviderConfig, ProviderConfigSet};
     use indwell_runs::RunStore;
     use indwell_security::{
@@ -2378,7 +2396,7 @@ mod tests {
     use super::{
         api_key_env_name, auth_context_for_inbound, build_router, command_prompt,
         decode_hex_or_utf8, execute_mock_tool, execute_provider_tool_calls, init_state,
-        provider_config_with_llm_fallback, session_token_from_headers,
+        persist_confirmation_grants, provider_config_with_llm_fallback, session_token_from_headers,
     };
 
     #[test]
@@ -3131,7 +3149,7 @@ mod tests {
         assert!(applied["output"]["reason"]
             .as_str()
             .unwrap()
-            .contains("already installed"));
+            .contains("trusted_signature"));
         let run_id = applied["run_id"].as_str().unwrap();
         let run = state
             .runs
@@ -3143,6 +3161,168 @@ mod tests {
         assert!(run.audit.tool_calls.iter().any(|call| {
             call.tool == "system.update.apply" && call.summary.contains("OTA apply refused")
         }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ota_apply_accepts_signed_manifest_from_trust_store() {
+        let root = temp_root("ota-apply-trusted");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let signing_key = SigningKey::from_bytes(&[31_u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let mut manifest = OtaManifest::host_sim_default();
+        manifest.version = "0.1.1-host-sim".to_string();
+        manifest.signature = hex_bytes(
+            signing_key
+                .sign(manifest_signature_payload(&manifest).as_bytes())
+                .to_bytes(),
+        );
+        {
+            let ota = state.ota.lock().await;
+            ota.save(&manifest).unwrap();
+            ota.save_trust_store(&OtaTrustStore::with_keys([hex_bytes(
+                verifying_key.as_bytes(),
+            )]))
+            .unwrap();
+        }
+        let grant = state.grants.lock().await.issue(
+            "owner",
+            "system.update.apply",
+            chrono::Utc::now().timestamp_millis() as u64,
+            60_000,
+        );
+        persist_confirmation_grants(&state).await.unwrap();
+        let token = issue_test_session(&state).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/system.update.apply/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "confirmation_grant_id": grant.grant_id,
+                            "input": {}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = response_data(response).await;
+        assert_eq!(data["decision"], "allow");
+        assert_eq!(data["output"]["accepted"], true);
+        assert_eq!(data["output"]["plan"]["version"], "0.1.1-host-sim");
+        assert_eq!(data["output"]["plan"]["to_slot"], "ota1");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn consumed_confirmation_grant_survives_host_restart() {
+        let root = temp_root("confirmation-grant-restart");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let token = issue_test_session(&state).await;
+        let app = build_router(state.clone());
+
+        let challenge_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/passphrase/challenge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(challenge_response.status(), StatusCode::OK);
+        let challenge = response_data(challenge_response).await;
+
+        let verify_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/passphrase/verify")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "challenge_id": challenge["challenge_id"],
+                            "spoken_phrase": challenge["phrase"],
+                            "subject_id": "owner",
+                            "allowed_tool": "system.update.apply"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verify_response.status(), StatusCode::OK);
+        let grant_id = response_data(verify_response).await["grant"]["grant_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let first_apply = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/system.update.apply/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "confirmation_grant_id": grant_id.clone(),
+                            "input": {}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_apply.status(), StatusCode::OK);
+        assert_eq!(response_data(first_apply).await["decision"], "allow");
+
+        let restarted = init_state(root.clone()).unwrap();
+        let restarted_token = issue_test_session(&restarted).await;
+        let restarted_app = build_router(restarted);
+        let replay_response = restarted_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tools/system.update.apply/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {restarted_token}"))
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "confirmation_grant_id": grant_id,
+                            "input": {}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        let replay = response_data(replay_response).await;
+        assert_eq!(replay["decision"], "require_confirmation");
+
         let _ = std::fs::remove_dir_all(root);
     }
 
