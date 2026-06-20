@@ -10,6 +10,7 @@ Phase 0 implements the policy shape that Proto v1 needs:
 - Provider config stores key references, not raw API keys.
 - Pairing challenges create paired device records from a short-lived code plus optional Ed25519 proof.
 - Signed requests verify a paired device over method, path, timestamp, nonce, and body hash.
+- Signed request nonces are consumed once and persisted locally to reject replayed session requests after restart.
 - Session tokens are signed locally and required for protected host-sim routes.
 - Unauthenticated public ingress is forced to mock providers when real provider config exists.
 - Unauthenticated channel memories are quarantined under `inbox/unverified`.
@@ -78,7 +79,10 @@ path=<request path>
 body_sha256=<lowercase hex sha256>
 ```
 
-The host simulator verifies that signature against the paired device public key before returning a session token.
+The host simulator verifies that signature against the paired device public key
+and consumes the per-device nonce before returning a session token. Replaying
+the same signed request within the clock-skew window is rejected, even after a
+host-sim restart.
 
 The static PWA implements this bootstrap locally:
 

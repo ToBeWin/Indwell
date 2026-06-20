@@ -95,7 +95,7 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 - Provider runtime: mock by default, plus OpenAI-compatible HTTP chat, structured tool calls, vision, ASR, TTS, and embedding paths for host/desktop.
 - Provider diagnostics: protected host-sim API and PWA buttons test LLM/Vision/ASR/TTS/Embedding slots independently.
 - Local secrets: host simulator seals local API secrets for an API key ref without returning the raw value.
-- Session auth: protected host-sim routes require a signed paired-device session token; the PWA can generate a browser Ed25519 keypair, complete signed pairing, and issue a session.
+- Session auth: protected host-sim routes require a signed paired-device session token; the PWA can generate a browser Ed25519 keypair, complete signed pairing, and issue a session with persisted nonce replay protection.
 - Confirmation grants: high-risk tools require a valid session plus a scoped, single-use passphrase grant; issued and consumed grants are persisted locally so replay attempts remain blocked after host restart.
 - Tool runtime: centralized host-sim tool catalog/schema lookup, provider-returned structured tool calls, planner fallback, status, LED, speaker, camera capture with optional Vision Provider analysis, sensor read mock, memory search/write/delete, identity, confirmation, OTA check.
 - OTA: local manifest store, HTTPS URL check, SHA-256 format check, trust-store Ed25519 manifest signature verification, confirmed apply UX, and signed apply plans with slot alternation.

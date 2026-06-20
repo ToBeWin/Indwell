@@ -44,9 +44,10 @@ use indwell_reflection::{ReflectionBudget, ReflectionEngine, ReflectionReport};
 use indwell_runs::{JsonlRunStore, RunLedgerEntry, RunStore};
 use indwell_security::{
     AuthSession, ConfirmationGrant, ConfirmationGrantManager, FileSealedSecretStore,
-    JsonConfirmationGrantStore, JsonPairedDeviceStore, PairedDevice, PairingChallenge,
-    PairingManager, PassphraseChallenge, PassphraseChallengeManager, PolicyDecision, PolicyEngine,
-    SessionTokenManager, SignedRequest, StoredSecret,
+    JsonConfirmationGrantStore, JsonPairedDeviceStore, JsonSignedRequestNonceStore, PairedDevice,
+    PairingChallenge, PairingManager, PassphraseChallenge, PassphraseChallengeManager,
+    PolicyDecision, PolicyEngine, SessionTokenManager, SignedRequest, SignedRequestNonceManager,
+    StoredSecret,
 };
 use ota::JsonOtaManifestStore;
 use planner::plan_tool_calls;
@@ -68,6 +69,8 @@ struct AppState {
     pairing: Arc<Mutex<PairingManager>>,
     paired_devices: Arc<JsonPairedDeviceStore>,
     sessions: Arc<Mutex<SessionTokenManager>>,
+    request_nonces: Arc<Mutex<SignedRequestNonceManager>>,
+    request_nonce_store: Arc<JsonSignedRequestNonceStore>,
     grants: Arc<Mutex<ConfirmationGrantManager>>,
     confirmation_grants: Arc<JsonConfirmationGrantStore>,
     passphrases: Arc<Mutex<PassphraseChallengeManager>>,
@@ -272,6 +275,9 @@ fn init_state(data_root: PathBuf) -> anyhow::Result<AppState> {
     let confirmation_grants_store =
         JsonConfirmationGrantStore::new(data_root.join("auth/confirmation_grants.json"))?;
     let grants = ConfirmationGrantManager::from_grants(confirmation_grants_store.load()?);
+    let request_nonce_store =
+        JsonSignedRequestNonceStore::new(data_root.join("auth/request_nonces.json"))?;
+    let request_nonces = SignedRequestNonceManager::from_nonces(request_nonce_store.load()?);
     let sessions = SessionTokenManager::new(host_secret_store_key(
         std::env::var("INDWELL_HOST_SIM_SESSION_KEY")
             .ok()
@@ -287,6 +293,8 @@ fn init_state(data_root: PathBuf) -> anyhow::Result<AppState> {
         pairing: Arc::new(Mutex::new(pairing)),
         paired_devices: Arc::new(paired_devices_store),
         sessions: Arc::new(Mutex::new(sessions)),
+        request_nonces: Arc::new(Mutex::new(request_nonces)),
+        request_nonce_store: Arc::new(request_nonce_store),
         grants: Arc::new(Mutex::new(grants)),
         confirmation_grants: Arc::new(confirmation_grants_store),
         passphrases: Arc::new(Mutex::new(PassphraseChallengeManager::default())),
@@ -1670,6 +1678,12 @@ async fn issue_auth_session(
         .find(|device| device.device_id == req.device_id)
         .ok_or(AppError::UnknownPairedDevice)?;
     indwell_security::verify_signed_request(&device, &signed, &signature, now_ms, 5 * 60 * 1000)?;
+    state
+        .request_nonces
+        .lock()
+        .await
+        .consume(&signed, now_ms, 5 * 60 * 1000)?;
+    persist_signed_request_nonces(&state).await?;
     let device = pairing.mark_seen(&req.device_id, now_ms)?;
     drop(pairing);
     persist_paired_devices(&state).await?;
@@ -1688,6 +1702,13 @@ async fn issue_auth_session(
 async fn persist_paired_devices(state: &AppState) -> Result<(), AppError> {
     let devices = state.pairing.lock().await.paired_devices();
     state.paired_devices.save(&devices)?;
+    Ok(())
+}
+
+async fn persist_signed_request_nonces(state: &AppState) -> Result<(), AppError> {
+    let mut nonces = state.request_nonces.lock().await;
+    nonces.retain_unexpired(Utc::now().timestamp_millis() as u64);
+    state.request_nonce_store.save(&nonces.nonces())?;
     Ok(())
 }
 
@@ -2718,6 +2739,16 @@ mod tests {
         let request_signature = signing_key
             .sign(signed_request_payload(&signed).as_bytes())
             .to_bytes();
+        let session_request_body = json!({
+            "device_id": signed.device_id,
+            "subject_id": "owner",
+            "timestamp_ms": signed.timestamp_ms,
+            "nonce": signed.nonce,
+            "method": signed.method,
+            "path": signed.path,
+            "body_sha256": signed.body_sha256,
+            "signature": hex_bytes(&request_signature),
+        });
 
         let session_response = app
             .clone()
@@ -2726,19 +2757,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/auth/session")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({
-                            "device_id": signed.device_id,
-                            "subject_id": "owner",
-                            "timestamp_ms": signed.timestamp_ms,
-                            "nonce": signed.nonce,
-                            "method": signed.method,
-                            "path": signed.path,
-                            "body_sha256": signed.body_sha256,
-                            "signature": hex_bytes(&request_signature),
-                        })
-                        .to_string(),
-                    ))
+                    .body(Body::from(session_request_body.to_string()))
                     .unwrap(),
             )
             .await
@@ -2746,6 +2765,20 @@ mod tests {
         assert_eq!(session_response.status(), StatusCode::OK);
         let session = response_data(session_response).await;
         let token = session["token"].as_str().unwrap();
+
+        let restarted_app = build_router(init_state(root.clone()).unwrap());
+        let replay_response = restarted_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(session_request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay_response.status(), StatusCode::BAD_REQUEST);
 
         let providers_response = app
             .oneshot(

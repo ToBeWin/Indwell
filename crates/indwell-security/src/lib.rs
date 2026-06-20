@@ -103,6 +103,14 @@ pub struct SignedRequest {
     pub body_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedRequestNonce {
+    pub device_id: String,
+    pub nonce: String,
+    pub first_seen_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum SecurityError {
     #[error("pairing challenge expired")]
@@ -153,6 +161,10 @@ pub enum SecurityError {
     SignedRequestStale,
     #[error("signed request signature verification failed")]
     SignedRequestSignatureInvalid,
+    #[error("signed request nonce must not be empty")]
+    SignedRequestEmptyNonce,
+    #[error("signed request nonce has already been used")]
+    SignedRequestNonceReplay,
     #[error("confirmation grant not found")]
     ConfirmationGrantNotFound,
     #[error("confirmation grant expired")]
@@ -225,8 +237,57 @@ pub struct SessionTokenManager {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct SignedRequestNonceManager {
+    nonces: BTreeMap<(String, String), SignedRequestNonce>,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct ConfirmationGrantManager {
     grants: BTreeMap<String, ConfirmationGrant>,
+}
+
+impl SignedRequestNonceManager {
+    pub fn from_nonces(nonces: impl IntoIterator<Item = SignedRequestNonce>) -> Self {
+        Self {
+            nonces: nonces
+                .into_iter()
+                .map(|nonce| ((nonce.device_id.clone(), nonce.nonce.clone()), nonce))
+                .collect(),
+        }
+    }
+
+    pub fn nonces(&self) -> Vec<SignedRequestNonce> {
+        self.nonces.values().cloned().collect()
+    }
+
+    pub fn consume(
+        &mut self,
+        request: &SignedRequest,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<SignedRequestNonce, SecurityError> {
+        let nonce = request.nonce.trim();
+        if nonce.is_empty() {
+            return Err(SecurityError::SignedRequestEmptyNonce);
+        }
+        self.retain_unexpired(now_ms);
+        let key = (request.device_id.clone(), nonce.to_string());
+        if self.nonces.contains_key(&key) {
+            return Err(SecurityError::SignedRequestNonceReplay);
+        }
+        let used = SignedRequestNonce {
+            device_id: request.device_id.clone(),
+            nonce: nonce.to_string(),
+            first_seen_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(ttl_ms),
+        };
+        self.nonces.insert(key, used.clone());
+        Ok(used)
+    }
+
+    pub fn retain_unexpired(&mut self, now_ms: u64) {
+        self.nonces.retain(|_, nonce| nonce.expires_at_ms >= now_ms);
+    }
 }
 
 impl ConfirmationGrantManager {
@@ -287,6 +348,39 @@ impl ConfirmationGrantManager {
         }
         grant.consumed_at_ms = Some(now_ms);
         Ok(grant.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonSignedRequestNonceStore {
+    path: PathBuf,
+}
+
+impl JsonSignedRequestNonceStore {
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, SecurityError> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(secret_store_io)?;
+        }
+        Ok(Self { path })
+    }
+
+    pub fn load(&self) -> Result<Vec<SignedRequestNonce>, SecurityError> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&self.path).map_err(secret_store_io)?;
+        serde_json::from_slice(&bytes).map_err(secret_store_json)
+    }
+
+    pub fn save(&self, nonces: &[SignedRequestNonce]) -> Result<(), SecurityError> {
+        let tmp_path = self.path.with_extension("json.tmp");
+        let mut file = fs::File::create(&tmp_path).map_err(secret_store_io)?;
+        serde_json::to_writer_pretty(&mut file, nonces).map_err(secret_store_json)?;
+        writeln!(file).map_err(secret_store_io)?;
+        file.flush().map_err(secret_store_io)?;
+        fs::rename(tmp_path, &self.path).map_err(secret_store_io)?;
+        Ok(())
     }
 }
 
@@ -887,8 +981,9 @@ mod tests {
     use super::{
         open_secret, pairing_signature_payload, seal_secret, ConfirmationGrantManager,
         FileSealedSecretStore, InMemorySecretStore, JsonConfirmationGrantStore,
-        JsonPairedDeviceStore, PairedDevice, PairingManager, PassphraseChallengeManager,
-        PolicyDecision, PolicyEngine, SecurityError, SignedRequest,
+        JsonPairedDeviceStore, JsonSignedRequestNonceStore, PairedDevice, PairingManager,
+        PassphraseChallengeManager, PolicyDecision, PolicyEngine, SecurityError, SignedRequest,
+        SignedRequestNonceManager,
     };
 
     #[test]
@@ -1269,6 +1364,74 @@ mod tests {
             super::verify_signed_request(&device, &request, &signature, 20_000, 5_000),
             Err(SecurityError::SignedRequestStale)
         ));
+    }
+
+    #[test]
+    fn signed_request_nonce_manager_rejects_replay() {
+        let request = SignedRequest {
+            device_id: "phone-1".to_string(),
+            timestamp_ms: 2000,
+            nonce: "nonce-1".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/auth/session".to_string(),
+            body_sha256: "abcd".to_string(),
+        };
+        let mut manager = SignedRequestNonceManager::default();
+
+        manager.consume(&request, 2000, 60_000).unwrap();
+
+        assert!(matches!(
+            manager.consume(&request, 3000, 60_000),
+            Err(SecurityError::SignedRequestNonceReplay)
+        ));
+    }
+
+    #[test]
+    fn signed_request_nonce_manager_expires_old_entries() {
+        let request = SignedRequest {
+            device_id: "phone-1".to_string(),
+            timestamp_ms: 2000,
+            nonce: "nonce-1".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/auth/session".to_string(),
+            body_sha256: "abcd".to_string(),
+        };
+        let mut manager = SignedRequestNonceManager::default();
+
+        manager.consume(&request, 2000, 10).unwrap();
+        let reused = manager.consume(&request, 3000, 10).unwrap();
+
+        assert_eq!(reused.first_seen_at_ms, 3000);
+    }
+
+    #[test]
+    fn json_signed_request_nonce_store_round_trips_used_nonces() {
+        let root = std::env::temp_dir().join(format!(
+            "indwell-signed-request-nonces-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store =
+            JsonSignedRequestNonceStore::new(root.join("auth/request_nonces.json")).unwrap();
+        let request = SignedRequest {
+            device_id: "phone-1".to_string(),
+            timestamp_ms: 2000,
+            nonce: "nonce-1".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/auth/session".to_string(),
+            body_sha256: "abcd".to_string(),
+        };
+        let mut manager = SignedRequestNonceManager::default();
+        manager.consume(&request, 2000, 60_000).unwrap();
+
+        store.save(&manager.nonces()).unwrap();
+        let mut restored = SignedRequestNonceManager::from_nonces(store.load().unwrap());
+
+        assert!(matches!(
+            restored.consume(&request, 3000, 60_000),
+            Err(SecurityError::SignedRequestNonceReplay)
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
