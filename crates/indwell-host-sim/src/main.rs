@@ -497,18 +497,42 @@ async fn mock_voice_turn(
 
     run.status = RunStatus::WaitingForProvider;
     let api_key = match providers.llm.api_key_ref.as_deref() {
-        Some(key_ref) => resolve_api_key(&state, key_ref).await?,
+        Some(key_ref) => match resolve_api_key(&state, key_ref).await {
+            Ok(api_key) => api_key,
+            Err(error) => {
+                fail_run(
+                    &state,
+                    &mut run,
+                    "failed",
+                    format!("llm api key: {error:?}"),
+                )
+                .await?;
+                return Err(error);
+            }
+        },
         None => None,
     };
-    let reply = chat_with_config(
+    let reply = match chat_with_config(
         &providers,
         api_key,
         contextual_chat_request(&run, &transcript.text),
     )
-    .await?
-    .text;
+    .await
+    {
+        Ok(response) => response.text,
+        Err(error) => {
+            fail_run(
+                &state,
+                &mut run,
+                "failed",
+                format!("llm provider: {error:?}"),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     checkpoint_run(&state, &run, "provider").await?;
-    let audio = synthesize_with_config(
+    let audio = match synthesize_with_config(
         &state,
         &providers,
         &reply,
@@ -517,7 +541,20 @@ async fn mock_voice_turn(
             language: Some("en".to_string()),
         },
     )
-    .await?;
+    .await
+    {
+        Ok(audio) => audio,
+        Err(error) => {
+            fail_run(
+                &state,
+                &mut run,
+                "failed",
+                format!("tts provider: {error:?}"),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     run.finish_with_summary(reply.clone(), Utc::now().timestamp_millis() as u64);
     state.runs.lock().await.append(&run)?;
 
@@ -590,11 +627,35 @@ async fn handle_channel_event(
         run.record_policy_block(note);
     }
     let api_key = match providers.llm.api_key_ref.as_deref() {
-        Some(key_ref) => resolve_api_key(&state, key_ref).await?,
+        Some(key_ref) => match resolve_api_key(&state, key_ref).await {
+            Ok(api_key) => api_key,
+            Err(error) => {
+                fail_run(
+                    &state,
+                    &mut run,
+                    "failed",
+                    format!("llm api key: {error:?}"),
+                )
+                .await?;
+                return Err(error);
+            }
+        },
         None => None,
     };
     let chat_response =
-        chat_with_config(&providers, api_key, contextual_chat_request(&run, &text)).await?;
+        match chat_with_config(&providers, api_key, contextual_chat_request(&run, &text)).await {
+            Ok(response) => response,
+            Err(error) => {
+                fail_run(
+                    &state,
+                    &mut run,
+                    "failed",
+                    format!("llm provider: {error:?}"),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
     let reply = chat_response.text;
     checkpoint_run(&state, &run, "provider").await?;
 
@@ -1719,6 +1780,16 @@ async fn checkpoint_run(state: &AppState, run: &AgentRun, stage: &str) -> Result
     Ok(())
 }
 
+async fn fail_run(
+    state: &AppState,
+    run: &mut AgentRun,
+    stage: &str,
+    reason: impl Into<String>,
+) -> Result<(), AppError> {
+    run.mark_failed(reason, Utc::now().timestamp_millis() as u64);
+    checkpoint_run(state, run, stage).await
+}
+
 async fn list_tools() -> Json<ApiEnvelope<ToolCatalogResponse>> {
     Json(ApiEnvelope::ok(ToolCatalogResponse {
         tools: tool_catalog(),
@@ -1847,7 +1918,20 @@ async fn execute_tool(
     run.status = RunStatus::WaitingForTool;
     checkpoint_run(&state, &run, "tool").await?;
     let execution =
-        execute_mock_tool(&state, &tool, req.input.unwrap_or_else(|| json!({}))).await?;
+        match execute_mock_tool(&state, &tool, req.input.unwrap_or_else(|| json!({}))).await {
+            Ok(execution) => execution,
+            Err(error) => {
+                run.record_tool_call(&tool, ToolAuditOutcome::Failed, format!("{error:?}"));
+                fail_run(
+                    &state,
+                    &mut run,
+                    "failed",
+                    format!("tool execution: {error:?}"),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
     run.record_tool_call(
         &tool,
         ToolAuditOutcome::Completed,
@@ -2715,6 +2799,62 @@ mod tests {
             .tags
             .iter()
             .any(|tag| tag == "unverified_ingress"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn provider_failure_is_persisted_as_failed_run_checkpoint() {
+        let root = temp_root("provider-failed-run");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let mut config = external_provider_config();
+        config.llm.api_key_ref = Some("missing_failed_run_key".to_string());
+        state.providers.lock().await.save(&config).unwrap();
+        let token = issue_test_session(&state).await;
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/channel/input")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "channel": "local_pwa",
+                            "session_id": "provider-failed-run",
+                            "text": "hello with broken provider",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let runs = state.runs.lock().await.list().unwrap();
+        let run = runs
+            .iter()
+            .find(|run| run.user_intent.as_deref() == Some("hello with broken provider"))
+            .expect("failed run should be persisted");
+        assert_eq!(run.status, indwell_core::RunStatus::Failed);
+        assert!(run
+            .audit
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("llm "));
+        let entries = state.runs.lock().await.entries_for_run(run.id).unwrap();
+        assert_eq!(
+            entries.last().map(|entry| entry.stage.as_str()),
+            Some("failed")
+        );
+        assert_eq!(
+            entries.last().map(|entry| entry.status.clone()),
+            Some(indwell_core::RunStatus::Failed)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

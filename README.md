@@ -89,7 +89,7 @@ curl -fsS -X POST http://127.0.0.1:3030/v1/voice/mock-turn \
 - Channel gateway: local PWA, LAN/BLE/USB style channels, chat app style channels, MQTT/Home Assistant/custom webhook normalization.
 - Policy engine: tool risk levels, owner checks, high-risk confirmation gates, public-channel camera blocking.
 - Public ingress guard: unauthenticated channel and mock voice ingress cannot spend user-owned provider keys; unverified input is quarantined in `inbox/unverified` for owner review.
-- Agent run audit: trigger, retrieved memories, written memories, exposed tools, policy blocks, provider output summary, including channel and mock voice turns, with checkpoint replay entries for durable execution review.
+- Agent run audit: trigger, retrieved memories, written memories, exposed tools, policy blocks, provider output summary, and failure reason, including channel and mock voice turns, with checkpoint replay entries for durable execution review.
 - Context assembly: persona snapshot, device state, retrieved memories, policy notes, and the current allowed tool subset are rendered into LLM chat requests instead of only being stored for audit.
 - Provider config: local JSON config with API key references, rejecting raw API keys in config.
 - Provider runtime: mock by default, plus OpenAI-compatible HTTP chat, structured tool calls, vision, ASR, TTS, and embedding paths for host/desktop.

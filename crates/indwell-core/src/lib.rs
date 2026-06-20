@@ -215,6 +215,7 @@ pub struct AgentRunAudit {
     pub tool_calls: Vec<ToolAuditRecord>,
     pub provider_output_summary: Option<String>,
     pub policy_blocks: Vec<String>,
+    pub failure_reason: Option<String>,
     pub completed_at_ms: Option<u64>,
 }
 
@@ -361,6 +362,12 @@ impl AgentRun {
         self.audit.completed_at_ms = Some(completed_at_ms);
         self.status = RunStatus::Completed;
     }
+
+    pub fn mark_failed(&mut self, reason: impl Into<String>, completed_at_ms: u64) {
+        self.audit.failure_reason = Some(reason.into());
+        self.audit.completed_at_ms = Some(completed_at_ms);
+        self.status = RunStatus::Failed;
+    }
 }
 
 pub fn default_tools() -> Vec<ToolDescriptor> {
@@ -475,6 +482,27 @@ mod tests {
 
         assert_eq!(run.status, RunStatus::BlockedByPolicy);
         assert_eq!(run.audit.policy_blocks, ["owner confirmation required"]);
+    }
+
+    #[test]
+    fn failed_run_records_reason_and_completion_time() {
+        let mut run = AgentRun::new(
+            Event::BootCompleted,
+            None,
+            AuthContext::anonymous(),
+            DeviceState::Thinking,
+            provider(),
+            10,
+        );
+
+        run.mark_failed("provider timeout", 20);
+
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            run.audit.failure_reason.as_deref(),
+            Some("provider timeout")
+        );
+        assert_eq!(run.audit.completed_at_ms, Some(20));
     }
 
     #[test]
