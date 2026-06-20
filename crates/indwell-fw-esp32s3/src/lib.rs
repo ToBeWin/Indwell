@@ -270,6 +270,7 @@ pub fn local_service_manifest(config: &Esp32S3FirmwareConfig) -> LocalServiceMan
             route("GET", "/v1/ota/manifest", "ota_manifest", true),
             route("POST", "/v1/ota/check", "ota_check", true),
             route("GET", "/v1/runs", "runs_list", true),
+            route("GET", "/v1/runs/:id/entries", "runs_entries", true),
             route("GET", "/v1/tools", "tools_list", true),
             route("POST", "/v1/tools/:tool/check", "tool_check", true),
             route("POST", "/v1/tools/:tool/execute", "tool_execute", true),

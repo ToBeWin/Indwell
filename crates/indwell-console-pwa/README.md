@@ -39,6 +39,7 @@ The console defaults to the host simulator at `http://127.0.0.1:3030`.
 - `POST /v1/ota/check`
 - `GET /v1/runs`
 - `GET /v1/runs/:id`
+- `GET /v1/runs/:id/entries`
 
 The `Apply update` button requires a matching `system.update.apply`
 confirmation grant. If no grant is present, the console issues a dynamic

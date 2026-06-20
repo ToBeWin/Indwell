@@ -1580,9 +1580,13 @@ async function fetchRunDetail(runId, button) {
   setBusy(button, true);
 
   try {
-    const data = await requestJson(`/v1/runs/${encodeURIComponent(runId)}`);
+    const [data, entries] = await Promise.all([
+      requestJson(`/v1/runs/${encodeURIComponent(runId)}`),
+      requestJson(`/v1/runs/${encodeURIComponent(runId)}/entries`),
+    ]);
     const run = data?.run || data;
     const audit = run?.audit || {};
+    const timeline = Array.isArray(entries) ? entries : [];
 
     els.runDetailResult.classList.remove("empty");
     els.runDetailResult.innerHTML = `
@@ -1591,8 +1595,9 @@ async function fetchRunDetail(runId, button) {
         <div><dt>Status</dt><dd>${escapeHtml(run?.status || "unknown")}</dd></div>
         <div><dt>Created</dt><dd>${escapeHtml(formatTime(run?.created_at_ms))}</dd></div>
         <div><dt>Tools</dt><dd>${escapeHtml((audit.exposed_tool_names || audit.allowed_tool_names || []).join(", ") || "none recorded")}</dd></div>
+        <div><dt>Checkpoints</dt><dd>${escapeHtml(timeline.map((entry) => `${entry.stage}:${entry.status}`).join(" -> ") || "none recorded")}</dd></div>
       </dl>
-      <pre class="json-preview">${escapeHtml(formatJson(data))}</pre>
+      <pre class="json-preview">${escapeHtml(formatJson({ run: data, entries: timeline }))}</pre>
     `;
   } catch (error) {
     renderError(els.runDetailResult, error);

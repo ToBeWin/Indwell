@@ -21,7 +21,8 @@ use indwell_channel::{
     ChannelPrincipal,
 };
 use indwell_core::{
-    AgentRun, AuthContext, AuthMethod, DeviceState, Event, ProviderSelection, ToolAuditOutcome,
+    AgentRun, AuthContext, AuthMethod, DeviceState, Event, ProviderSelection, RunStatus,
+    ToolAuditOutcome,
 };
 use indwell_memory::{
     JsonlMemoryStore, MemoryExport, MemoryKind, MemoryMetabolismReport, MemoryQuery, MemoryRecord,
@@ -40,7 +41,7 @@ use indwell_provider::{
     VisionProvider, VisionRequest, VoiceProfile,
 };
 use indwell_reflection::{ReflectionBudget, ReflectionEngine, ReflectionReport};
-use indwell_runs::{JsonlRunStore, RunStore};
+use indwell_runs::{JsonlRunStore, RunLedgerEntry, RunStore};
 use indwell_security::{
     AuthSession, ConfirmationGrant, ConfirmationGrantManager, FileSealedSecretStore,
     JsonPairedDeviceStore, PairedDevice, PairingChallenge, PairingManager, PassphraseChallenge,
@@ -334,6 +335,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/ota/trust", get(get_ota_trust).put(save_ota_trust))
         .route("/v1/runs", get(list_runs))
         .route("/v1/runs/:id", get(get_run))
+        .route("/v1/runs/:id/entries", get(get_run_entries))
         .route("/v1/tools", get(list_tools))
         .route("/v1/tools/:tool/check", post(check_tool))
         .route("/v1/tools/:tool/execute", post(execute_tool))
@@ -475,7 +477,9 @@ async fn mock_voice_turn(
         Utc::now().timestamp_millis() as u64,
     );
     run.audit.input_summary = Some(transcript.text.clone());
+    checkpoint_run(&state, &run, "created").await?;
 
+    run.status = RunStatus::AssemblingContext;
     let memory_query = state.context.memory_query(&transcript.text);
     let retrieved_memories = state.memory.lock().await.search(memory_query)?;
     let assembly = state.context.assemble(
@@ -489,7 +493,9 @@ async fn mock_voice_turn(
     if let Some(note) = provider_policy_note {
         run.record_policy_block(note);
     }
+    checkpoint_run(&state, &run, "context").await?;
 
+    run.status = RunStatus::WaitingForProvider;
     let api_key = match providers.llm.api_key_ref.as_deref() {
         Some(key_ref) => resolve_api_key(&state, key_ref).await?,
         None => None,
@@ -501,6 +507,7 @@ async fn mock_voice_turn(
     )
     .await?
     .text;
+    checkpoint_run(&state, &run, "provider").await?;
     let audio = synthesize_with_config(
         &state,
         &providers,
@@ -559,7 +566,9 @@ async fn handle_channel_event(
         Utc::now().timestamp_millis() as u64,
     );
     run.audit.input_summary = Some(text.clone());
+    checkpoint_run(&state, &run, "created").await?;
 
+    run.status = RunStatus::AssemblingContext;
     let memory_query = state.context.memory_query(&text);
     let retrieved_memories = state.memory.lock().await.search(memory_query)?;
     let assembly = state.context.assemble(
@@ -570,7 +579,9 @@ async fn handle_channel_event(
         &run.auth_context,
     );
     apply_context_pack(&mut run, DeviceState::Thinking, assembly);
+    checkpoint_run(&state, &run, "context").await?;
 
+    run.status = RunStatus::WaitingForProvider;
     let providers = state.providers.lock().await.load()?;
     let (providers, provider_policy_note) =
         provider_config_for_ingress(&providers, &run.auth_context);
@@ -585,12 +596,15 @@ async fn handle_channel_event(
     let chat_response =
         chat_with_config(&providers, api_key, contextual_chat_request(&run, &text)).await?;
     let reply = chat_response.text;
+    checkpoint_run(&state, &run, "provider").await?;
 
+    run.status = RunStatus::WaitingForTool;
     if chat_response.tool_calls.is_empty() {
         execute_planned_tool_calls(&state, &mut run, &text).await;
     } else {
         execute_provider_tool_calls(&state, &mut run, chat_response.tool_calls).await;
     }
+    checkpoint_run(&state, &run, "tool").await?;
 
     let memory_id = if !text.trim().is_empty() {
         let owner_authenticated = run.auth_context.owner_authenticated;
@@ -1688,6 +1702,23 @@ async fn get_run(
     Ok(Json(ApiEnvelope::ok(run)))
 }
 
+async fn get_run_entries(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiEnvelope<Vec<RunLedgerEntry>>>, AppError> {
+    let entries = state.runs.lock().await.entries_for_run(id)?;
+    Ok(Json(ApiEnvelope::ok(entries)))
+}
+
+async fn checkpoint_run(state: &AppState, run: &AgentRun, stage: &str) -> Result<(), AppError> {
+    state
+        .runs
+        .lock()
+        .await
+        .append_checkpoint(run, stage, Utc::now().timestamp_millis() as u64)?;
+    Ok(())
+}
+
 async fn list_tools() -> Json<ApiEnvelope<ToolCatalogResponse>> {
     Json(ApiEnvelope::ok(ToolCatalogResponse {
         tools: tool_catalog(),
@@ -1758,6 +1789,7 @@ async fn execute_tool(
         now,
     );
     run.allowed_tools.push(descriptor.clone());
+    checkpoint_run(&state, &run, "created").await?;
 
     if decision != PolicyDecision::Allow {
         let summary = format!("blocked by policy: {decision:?}");
@@ -1812,6 +1844,8 @@ async fn execute_tool(
         }
     }
 
+    run.status = RunStatus::WaitingForTool;
+    checkpoint_run(&state, &run, "tool").await?;
     let execution =
         execute_mock_tool(&state, &tool, req.input.unwrap_or_else(|| json!({}))).await?;
     run.record_tool_call(
@@ -3096,6 +3130,7 @@ mod tests {
         let app = build_router(state.clone());
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3117,6 +3152,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let data = response_data(response).await;
+        let run_id = data["run_id"].as_str().unwrap();
+        let entries_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/runs/{run_id}/entries"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entries_response.status(), StatusCode::OK);
+        let entries = response_data(entries_response).await;
+        let stages = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["stage"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(stages.starts_with(&["created", "context", "provider", "tool"]));
+        assert_eq!(stages.last().copied(), Some("completed"));
+
         let records = state
             .memory
             .lock()

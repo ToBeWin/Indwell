@@ -15,7 +15,7 @@ Implemented in host simulator:
 - dynamic passphrase confirmation grants for high-risk actions
 - channel policy defaults for local, LAN, chat apps, MQTT, Home Assistant, and custom webhooks
 - mobile command normalization for command-style events
-- run audit for every channel input and mock voice turn
+- run audit for every channel input and mock voice turn, including replayable checkpoint entries
 - context-aware LLM requests that include compact persona/device/memory/policy context
 - owner-authenticated camera capture can request Vision Provider analysis
 - OTA Apply checks for a scoped `system.update.apply` confirmation grant before executing
