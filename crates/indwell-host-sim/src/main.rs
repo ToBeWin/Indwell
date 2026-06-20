@@ -7,7 +7,10 @@ mod tools;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    extract::{Path, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -235,6 +238,18 @@ struct ToolCatalogResponse {
     tools: Vec<HostToolCatalogItem>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WsEventsQuery {
+    token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WsEventEnvelope {
+    event: &'static str,
+    recorded_at_ms: u64,
+    data: Value,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -311,6 +326,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/voice/mock-turn", post(mock_voice_turn))
         .route("/v1/gateway/custom-webhook", post(custom_webhook_input))
         .route("/v1/channels/policies", get(channel_policies))
+        .route("/v1/ws/events", get(ws_events))
         .route("/v1/pairing/challenge", post(issue_pairing_challenge))
         .route("/v1/pairing/complete", post(complete_pairing))
         .route("/v1/auth/session", post(issue_auth_session))
@@ -436,6 +452,121 @@ async fn custom_webhook_input(
     Json(req): Json<CustomWebhookInputRequest>,
 ) -> Result<Json<ApiEnvelope<ChannelInputResponse>>, AppError> {
     handle_channel_event(state, req.into()).await
+}
+
+async fn ws_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WsEventsQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, AppError> {
+    let token = query
+        .token
+        .or_else(|| session_token_from_headers(&headers))
+        .ok_or(AppError::MissingSessionToken)?;
+    let session = state
+        .sessions
+        .lock()
+        .await
+        .verify(&token, Utc::now().timestamp_millis() as u64)?;
+
+    Ok(ws
+        .on_upgrade(move |socket| ws_events_stream(socket, state, session))
+        .into_response())
+}
+
+async fn ws_events_stream(mut socket: WebSocket, state: AppState, session: AuthSession) {
+    let events = match ws_event_bootstrap_snapshot(&state, &session).await {
+        Ok(events) => events,
+        Err(error) => {
+            let fallback = WsEventEnvelope {
+                event: "error",
+                recorded_at_ms: Utc::now().timestamp_millis() as u64,
+                data: json!({
+                    "code": "snapshot_failed",
+                    "message": format!("{error:?}"),
+                }),
+            };
+            vec![fallback]
+        }
+    };
+
+    for event in events {
+        let Ok(payload) = serde_json::to_string(&event) else {
+            continue;
+        };
+        if socket.send(Message::Text(payload)).await.is_err() {
+            return;
+        }
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+async fn ws_event_bootstrap_snapshot(
+    state: &AppState,
+    session: &AuthSession,
+) -> Result<Vec<WsEventEnvelope>, AppError> {
+    let now_ms = Utc::now().timestamp_millis() as u64;
+    let providers = state.providers.lock().await.load()?;
+    let runs = state.runs.lock().await.list()?;
+    let mut recent_runs = runs
+        .iter()
+        .rev()
+        .take(5)
+        .map(|run| {
+            json!({
+                "id": run.id,
+                "status": run.status,
+                "user_intent": run.user_intent,
+                "created_at_ms": run.created_at_ms,
+                "completed_at_ms": run.audit.completed_at_ms,
+                "failure_reason": run.audit.failure_reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    recent_runs.reverse();
+    let tools = tool_catalog();
+
+    Ok(vec![
+        WsEventEnvelope {
+            event: "status",
+            recorded_at_ms: now_ms,
+            data: json!({
+                "service": "indwell-host-sim",
+                "state": "idle",
+                "subject_id": session.subject_id,
+                "provider": {
+                    "kind": providers.llm.kind,
+                    "model": providers.llm.model,
+                },
+                "memory_backend": "jsonl",
+                "run_count": runs.len(),
+            }),
+        },
+        WsEventEnvelope {
+            event: "tools",
+            recorded_at_ms: now_ms,
+            data: json!({
+                "count": tools.len(),
+                "tools": tools
+                    .iter()
+                    .map(|tool| json!({
+                        "name": tool.name,
+                        "risk": tool.risk,
+                        "requires_owner": tool.requires_owner,
+                        "requires_confirmation": tool.requires_confirmation,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        },
+        WsEventEnvelope {
+            event: "runs",
+            recorded_at_ms: now_ms,
+            data: json!({
+                "recent": recent_runs,
+            }),
+        },
+    ])
 }
 
 async fn mock_voice_turn(
@@ -2418,6 +2549,7 @@ mod tests {
         api_key_env_name, auth_context_for_inbound, build_router, command_prompt,
         decode_hex_or_utf8, execute_mock_tool, execute_provider_tool_calls, init_state,
         persist_confirmation_grants, provider_config_with_llm_fallback, session_token_from_headers,
+        ws_event_bootstrap_snapshot,
     };
 
     #[test]
@@ -2672,6 +2804,50 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn websocket_events_route_requires_session_token() {
+        let root = temp_root("ws-events-auth");
+        let _ = std::fs::remove_dir_all(&root);
+        let app = build_router(init_state(root.clone()).unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/ws/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn websocket_bootstrap_snapshot_exposes_status_tools_and_runs() {
+        let root = temp_root("ws-events-snapshot");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = init_state(root.clone()).unwrap();
+        let token = issue_test_session(&state).await;
+        let session = state
+            .sessions
+            .lock()
+            .await
+            .verify(&token, chrono::Utc::now().timestamp_millis() as u64)
+            .unwrap();
+
+        let events = ws_event_bootstrap_snapshot(&state, &session).await.unwrap();
+        let event_names = events.iter().map(|event| event.event).collect::<Vec<_>>();
+
+        assert_eq!(event_names, ["status", "tools", "runs"]);
+        assert_eq!(events[0].data["subject_id"], "owner");
+        assert!(events[1].data["count"].as_u64().unwrap() >= 10);
+        assert!(events[2].data["recent"].is_array());
+
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -11,6 +11,7 @@ Implemented in host simulator:
 
 - `POST /v1/channel/input`
 - `POST /v1/gateway/custom-webhook`
+- `GET /v1/ws/events?token=<session-token>` for authenticated LAN event snapshots
 - paired-device session auth for protected local control APIs
 - dynamic passphrase confirmation grants for high-risk actions, persisted across host restarts after issue/consume
 - channel policy defaults for local, LAN, chat apps, MQTT, Home Assistant, and custom webhooks
@@ -28,6 +29,11 @@ The local PWA automatically attaches a stored `indwell.console.sessionToken`
 as a bearer token. A production mobile app should keep the paired-device
 private key in the OS keystore and sign session requests instead of storing
 long-lived raw credentials in application state.
+
+For browser WebSocket clients, `GET /v1/ws/events` accepts the same session
+token as a `token` query parameter because the WebSocket constructor cannot set
+custom authorization headers. The stream currently sends compact `status`,
+`tools`, and `runs` snapshot events immediately after connection.
 
 The host-sim console can create that token directly:
 
